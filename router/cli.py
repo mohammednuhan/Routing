@@ -1,9 +1,12 @@
-"""tamias-router command line: `status`, `start` and `log`.
+"""tamias-router command line: `status`, `start`, `log`, `report` and
+`ledger-info`.
 
 `status` reads the config and prints it. It makes no network calls. `start`
 validates the config and runs the transparent loopback proxy; it makes no
 routing decision and changes no model. `log` prints decision-log rows, which
-never contain request or response content.
+never contain request or response content. `report` counts those same rows and
+`ledger-info` prints a SQLite file's schema; both open their database read-only
+and neither can write a row.
 """
 from __future__ import annotations
 
@@ -14,7 +17,7 @@ from pathlib import Path
 
 from .breaker import REASON_CIRCUIT_OPEN
 from .config import DEFAULT_CONFIG_PATH, RouterConfig, load_config_or_exit
-from .decisions import DecisionLog, DecisionRow
+from .decisions import DecisionLog, DecisionRow, default_db_path
 from .killswitch import (
     KILL_SWITCH_FILENAME,
     REASON_KILL_SWITCH,
@@ -22,7 +25,17 @@ from .killswitch import (
     read_kill_switch,
     write_kill_switch,
 )
+from .ledger import format_ledger, inspect_ledger
 from .proxy import ProxyError, ProxySettings, parse_upstream, serve
+from .readonly import ReadOnlyError
+from .report import (
+    NOTHING_RECORDED,
+    ReportFilters,
+    as_json,
+    build_report,
+    format_report,
+    parse_since,
+)
 from .safety import is_blocked
 from .state import SessionStore
 
@@ -83,6 +96,44 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub.add_parser(
         "on", help="turn the kill switch off: remove the router.off flag file"
+    )
+
+    report = sub.add_parser(
+        "report",
+        help="summarise the decision log (read-only, metadata only, no cost)",
+    )
+    report.add_argument(
+        "--since",
+        default=None,
+        metavar="ISO_TIMESTAMP",
+        help="only rows at or after this UTC timestamp, e.g. 2026-10-01T00:00:00Z",
+    )
+    report.add_argument(
+        "--last", type=int, default=None, metavar="N", help="only the newest N rows"
+    )
+    report.add_argument(
+        "--session",
+        default=None,
+        metavar="HINT",
+        help="only rows whose session_hint is exactly HINT",
+    )
+    report.add_argument(
+        "--json",
+        dest="as_json",
+        action="store_true",
+        help="print one JSON object instead of the sections",
+    )
+
+    ledger = sub.add_parser(
+        "ledger-info",
+        help="print a SQLite file's tables, columns and row counts (read-only)",
+    )
+    ledger.add_argument(
+        "--ledger",
+        required=True,
+        type=Path,
+        metavar="PATH",
+        help="path to the SQLite file to inspect",
     )
     return parser
 
@@ -163,6 +214,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "log":
         return _log(args.last, show_signals=getattr(args, "signals", False))
 
+    if args.cmd == "report":
+        return _report(args)
+
+    if args.cmd == "ledger-info":
+        return _ledger_info(args.ledger)
+
     config = load_config_or_exit(args.config)
 
     if args.cmd == "status":
@@ -217,6 +274,51 @@ def _log(last: int, show_signals: bool = False) -> int:
         for row in rows:
             print(f"\n{id if False else ''}signals for decision_id={row.decision_id}:")
             print(json.dumps(row.signal_values, indent=2, sort_keys=True))
+    return 0
+
+
+def _report(args: argparse.Namespace) -> int:
+    """Count the decision log. Read-only, and it never creates the database."""
+    if args.last is not None and args.last < 1:
+        print(f"{PROG}: --last must be 1 or more, got {args.last}", file=sys.stderr)
+        return 2
+
+    since = None
+    if args.since is not None:
+        try:
+            since = parse_since(args.since)
+        except ValueError as exc:
+            print(f"{PROG}: --since {exc}", file=sys.stderr)
+            return 2
+
+    filters = ReportFilters(since=since, last=args.last, session=args.session)
+    path = default_db_path()
+    if not path.is_file():
+        print(f"{NOTHING_RECORDED} (no database at {path})")
+        return 0
+
+    try:
+        report = build_report(path, filters)
+    except ReadOnlyError as exc:
+        print(f"{PROG}: {exc}", file=sys.stderr)
+        return 1
+
+    if report.requests == 0:
+        print(f"{NOTHING_RECORDED} (nothing matching in {path})")
+        return 0
+
+    print(as_json(report) if args.as_json else format_report(report))
+    return 0
+
+
+def _ledger_info(path: Path) -> int:
+    """Print a SQLite file's schema. Read-only, and no row is ever selected."""
+    try:
+        tables = inspect_ledger(path)
+    except ReadOnlyError as exc:
+        print(f"{PROG}: {exc}", file=sys.stderr)
+        return 1
+    print(format_ledger(path, tables))
     return 0
 
 

@@ -105,9 +105,9 @@ def apply_hold(
     if state.held_requests >= hold_max_requests(config):
         return (decision, state.released_hold())
     if _cap_blocked(decision):
-        # The session has spent its whole switching budget and the cap said no.
-        # A hold is a change of model, so letting it past the cap would make the
-        # cap unenforceable for exactly the sessions it exists to bound.
+        # A BLOCKED_SWITCH_CAP stay releases the hold, deliberately. A hold is a
+        # change of model, so serving one here would make the session's switching
+        # budget unenforceable for exactly the sessions it exists to bound.
         return (decision, state.released_hold())
     if not _is_legal(config, state.held_model) or not _is_legal(config, requested_model):
         # Rule 7, on both ends: nothing outside the config is ever held, and a

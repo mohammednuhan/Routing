@@ -543,7 +543,12 @@ def test_nothing_changes_while_the_switch_is_off(tmp_path, monkeypatch):
         assert switched.reason_codes == ["ESCALATE_TOOL_ERRORS"]
         assert switched.mode == "active"
 
-        post_once(harness.proxy_port, stay_body())
+        # A different first user message is a different session, so nothing
+        # approved above can hold this one: it must still reach NO_RULE_MATCHED.
+        elsewhere = json.loads(stay_body().decode())
+        elsewhere["messages"][0]["content"] = "a different session entirely"
+
+        post_once(harness.proxy_port, json.dumps(elsewhere).encode())
         assert wait_for_rows(log, 2) == 2
         stayed = log.recent(1)[0]
         assert stayed.applied == 0

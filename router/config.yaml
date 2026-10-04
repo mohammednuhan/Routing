@@ -114,3 +114,13 @@ policy:
   # provider 500 does not count: the router handled those correctly.
   breaker_error_threshold: 3
   breaker_cooldown_seconds: 60
+  # Model hold. After a switch is approved in active mode, the model it chose is
+  # held for that session, because the client keeps sending the model it
+  # configured and would otherwise be put straight back on the next request.
+  # While the hold is live, a request naming the model the switch came FROM is
+  # routed to the held model and logged with reason HELD_MODEL. The hold does
+  # not pass dwell, hysteresis or the cost check, does not count as a switch,
+  # and is released by a new approved switch, by hold_max_requests served
+  # requests, by a request naming another model, or by the kill switch, an open
+  # circuit or mode `off`.
+  hold_max_requests: 50

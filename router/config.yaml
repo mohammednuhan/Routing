@@ -41,6 +41,12 @@ models:
       - TODO_EFFORT_MEDIUM
       - TODO_EFFORT_HIGH
     cost_tier: low
+    # TODO(owner): input/output price per million tokens. Null means UNKNOWN,
+    # not zero. Leave null until a dated price sheet supplies real figures; a
+    # response priced against a null price is reported as UNKNOWN, never as $0.
+    # For a dummy-priced copy for testing only, see tools/sample-config-DUMMY-prices.yaml.
+    input_per_million: null
+    output_per_million: null
     # TODO(owner): cache price per million tokens. Null means UNKNOWN, not zero.
     # Leave null until a dated price sheet supplies real figures; a switch whose
     # cost cannot be computed is blocked, never allowed on an assumed price.
@@ -53,6 +59,12 @@ models:
       - TODO_EFFORT_MEDIUM
       - TODO_EFFORT_HIGH
     cost_tier: mid
+    # TODO(owner): input/output price per million tokens. Null means UNKNOWN,
+    # not zero. Leave null until a dated price sheet supplies real figures; a
+    # response priced against a null price is reported as UNKNOWN, never as $0.
+    # For a dummy-priced copy for testing only, see tools/sample-config-DUMMY-prices.yaml.
+    input_per_million: null
+    output_per_million: null
     # TODO(owner): cache price per million tokens. Null means UNKNOWN, not zero.
     # Leave null until a dated price sheet supplies real figures; a switch whose
     # cost cannot be computed is blocked, never allowed on an assumed price.
@@ -65,6 +77,12 @@ models:
       - TODO_EFFORT_MEDIUM
       - TODO_EFFORT_HIGH
     cost_tier: high
+    # TODO(owner): input/output price per million tokens. Null means UNKNOWN,
+    # not zero. Leave null until a dated price sheet supplies real figures; a
+    # response priced against a null price is reported as UNKNOWN, never as $0.
+    # For a dummy-priced copy for testing only, see tools/sample-config-DUMMY-prices.yaml.
+    input_per_million: null
+    output_per_million: null
     # TODO(owner): cache price per million tokens. Null means UNKNOWN, not zero.
     # Leave null until a dated price sheet supplies real figures; a switch whose
     # cost cannot be computed is blocked, never allowed on an assumed price.

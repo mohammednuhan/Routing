@@ -13,10 +13,17 @@
 # ids as placeholders precisely because no verified ids or price sheet exist.
 #
 # The dummy numbers are:
-#   cache_write_per_million: 3.75     for every model
-#   cache_read_per_million:  0.30     for every model
+#   cache_write_per_million: 3.75     for test-mid and test-high
+#   cache_read_per_million:  0.30     for test-mid and test-high
+#   input_per_million:       3.00     for test-mid and test-high
+#   output_per_million:     15.00     for test-mid and test-high
 #   escalate_benefit_usd:    0.001
 #   downgrade_benefit_usd:   0.001
+#
+# `test-low` carries 0.0 for all four prices on purpose. Zero is a price, not an
+# absence: it makes test-low a genuinely free model, so the cost tests can tell
+# a free model (cost exactly 0.0) apart from a model whose price nobody has
+# verified (cost UNKNOWN). It is never rounded to null and never read as unknown.
 #
 # `routed_header` is true here so the tests can observe the header. It is false
 # in the shipped config: a header naming a hop the router did not make would be
@@ -39,8 +46,12 @@ models:
       - test-effort-high
     cost_tier: low
     # DUMMY VALUES, NOT REAL PRICES
-    cache_write_per_million: 3.75
-    cache_read_per_million: 0.30
+    # 0.0 across the board: test-low stands for a genuinely free model, so the
+    # cost tests have a price of zero that is a real price rather than a null.
+    input_per_million: 0.0
+    output_per_million: 0.0
+    cache_write_per_million: 0.0
+    cache_read_per_million: 0.0
   - id: test-mid
     legal_efforts:
       - test-effort-low
@@ -48,6 +59,8 @@ models:
       - test-effort-high
     cost_tier: mid
     # DUMMY VALUES, NOT REAL PRICES
+    input_per_million: 3.0
+    output_per_million: 15.0
     cache_write_per_million: 3.75
     cache_read_per_million: 0.30
   - id: test-high
@@ -57,6 +70,8 @@ models:
       - test-effort-high
     cost_tier: high
     # DUMMY VALUES, NOT REAL PRICES
+    input_per_million: 3.0
+    output_per_million: 15.0
     cache_write_per_million: 3.75
     cache_read_per_million: 0.30
 

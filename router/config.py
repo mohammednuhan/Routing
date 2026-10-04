@@ -42,6 +42,46 @@ DEFAULT_MAX_SWITCHES_PER_SESSION = 10
 #: Requests one model hold may serve before it is released.
 DEFAULT_HOLD_MAX_REQUESTS = 50
 
+# --- Classifier defaults -------------------------------------------------
+#
+# The classifier is additive and off by default. Every number below is a plain
+# rule weight, not a measurement: it is read in `router/classifier.py` and
+# nothing else, and none of them can cause a request to change on their own.
+
+#: Score a prompt starts from before any rule is applied.
+DEFAULT_CLASSIFIER_BASE = 50
+
+#: Added per distinct strong keyword, never more than `strong_cap` in total.
+DEFAULT_CLASSIFIER_STRONG = 25
+DEFAULT_CLASSIFIER_STRONG_CAP = 50
+
+#: Added per distinct cheap keyword. Negative, and never below `cheap_cap`.
+DEFAULT_CLASSIFIER_CHEAP = -20
+DEFAULT_CLASSIFIER_CHEAP_CAP = -40
+
+#: Length thresholds, in characters, and the points each one is worth.
+DEFAULT_CLASSIFIER_LONG_CHARS = 200
+DEFAULT_CLASSIFIER_LONG_POINTS = 10
+DEFAULT_CLASSIFIER_VERY_LONG_CHARS = 600
+DEFAULT_CLASSIFIER_VERY_LONG_POINTS = 20
+
+#: How many file-like tokens make a prompt a file-shaped task, and its points.
+DEFAULT_CLASSIFIER_MANY_FILES = 3
+DEFAULT_CLASSIFIER_MANY_FILES_POINTS = 15
+
+#: Points removed when the whole prompt is a single question.
+DEFAULT_CLASSIFIER_QUESTION_POINTS = -10
+
+#: Score at or above which a prompt is tier `high`.
+DEFAULT_CLASSIFIER_STRONG_FROM = 65
+
+#: Score below which a prompt is tier `low`. Between the two it is `mid`.
+DEFAULT_CLASSIFIER_CHEAP_BELOW = 35
+
+#: The tier names a score maps to. They are the same `cost_tier` labels the
+#: models carry, so a classified tier names a tier a model can already have.
+LEGAL_CLASSIFIER_TIERS: tuple[str, ...] = ("low", "mid", "high")
+
 
 class ConfigError(Exception):
     """The config file is missing, unreadable, malformed, or illegal."""
@@ -51,13 +91,18 @@ class ConfigError(Exception):
 class ModelSpec:
     """One legal model: its id, the efforts legal for it, and its cost tier.
 
-    The cache prices are optional and default to None. None means "unknown",
-    never zero: a switch whose cost cannot be computed is blocked, not allowed.
+    Every price is optional and defaults to None. None means "unknown", never
+    zero: a switch whose cost cannot be computed is blocked, not allowed, and a
+    response whose cost cannot be computed is reported as unknown rather than as
+    free. A price of 0.0 is a real price - a model that is genuinely free - and
+    is kept as 0.0, never turned into None.
     """
 
     id: str
     legal_efforts: tuple[str, ...]
     cost_tier: str
+    input_per_million: float | None = None
+    output_per_million: float | None = None
     cache_write_per_million: float | None = None
     cache_read_per_million: float | None = None
 
@@ -89,6 +134,41 @@ class PolicySpec:
 
 
 @dataclass(frozen=True)
+class ClassifierPoints:
+    """Rule weights for the classifier. Integers, never guesses.
+
+    `cheap` and `cheap_cap` are negative on purpose: a cheap keyword pushes the
+    score down, and `cheap_cap` is the floor that keeps a prompt full of them
+    from reaching zero by arithmetic alone.
+    """
+
+    base: int = DEFAULT_CLASSIFIER_BASE
+    strong: int = DEFAULT_CLASSIFIER_STRONG
+    strong_cap: int = DEFAULT_CLASSIFIER_STRONG_CAP
+    cheap: int = DEFAULT_CLASSIFIER_CHEAP
+    cheap_cap: int = DEFAULT_CLASSIFIER_CHEAP_CAP
+    long_chars: int = DEFAULT_CLASSIFIER_LONG_CHARS
+    long_points: int = DEFAULT_CLASSIFIER_LONG_POINTS
+    very_long_chars: int = DEFAULT_CLASSIFIER_VERY_LONG_CHARS
+    very_long_points: int = DEFAULT_CLASSIFIER_VERY_LONG_POINTS
+    many_files: int = DEFAULT_CLASSIFIER_MANY_FILES
+    many_files_points: int = DEFAULT_CLASSIFIER_MANY_FILES_POINTS
+    question_points: int = DEFAULT_CLASSIFIER_QUESTION_POINTS
+
+
+@dataclass(frozen=True)
+class ClassifierSpec:
+    """The optional `classifier` section. Absent means disabled, never enabled."""
+
+    enabled: bool = False
+    strong_keywords: tuple[str, ...] = ()
+    cheap_keywords: tuple[str, ...] = ()
+    points: ClassifierPoints = ClassifierPoints()
+    cheap_below: int = DEFAULT_CLASSIFIER_CHEAP_BELOW
+    strong_from: int = DEFAULT_CLASSIFIER_STRONG_FROM
+
+
+@dataclass(frozen=True)
 class RouterConfig:
     """A validated router configuration."""
 
@@ -100,6 +180,7 @@ class RouterConfig:
     default_model: str
     default_effort: str
     policy: PolicySpec | None = None
+    classifier: ClassifierSpec | None = None
     routed_header: bool = False
     source: Path | None = None
 
@@ -289,6 +370,8 @@ def _parse_model(raw: Any, index: int) -> ModelSpec:
         id=model_id,
         legal_efforts=tuple(efforts),
         cost_tier=cost_tier,
+        input_per_million=_parse_price(data, "input_per_million", where),
+        output_per_million=_parse_price(data, "output_per_million", where),
         cache_write_per_million=_parse_price(data, "cache_write_per_million", where),
         cache_read_per_million=_parse_price(data, "cache_read_per_million", where),
     )
@@ -298,7 +381,9 @@ def _parse_price(data: dict[str, Any], key: str, where: str) -> float | None:
     """A per-million price: a non-negative number, or null for "unknown".
 
     Absent and null both mean unknown. A string is rejected rather than parsed,
-    so a price can never be a number that nobody verified.
+    so a price can never be a number that nobody verified. Zero is a price, not
+    an absence: a model nobody pays for is free, and reporting that as "unknown"
+    would be wrong in the opposite direction.
     """
     value = data.get(key)
     if value is None:

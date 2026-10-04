@@ -1,12 +1,14 @@
-"""tamias-router command line: `status`, `start`, `log`, `report` and
-`ledger-info`.
+"""tamias-router command line: `status`, `start`, `log`, `report`,
+`ledger-info` and `switch-report`.
 
 `status` reads the config and prints it. It makes no network calls. `start`
 validates the config and runs the transparent loopback proxy; it makes no
 routing decision and changes no model. `log` prints decision-log rows, which
 never contain request or response content. `report` counts those same rows and
 `ledger-info` prints a SQLite file's schema; both open their database read-only
-and neither can write a row.
+and neither can write a row. `switch-report` correlates approved switches with
+the rows the Tamias Observer ledger recorded around the same time, by time
+alone, and says so.
 """
 from __future__ import annotations
 
@@ -38,6 +40,20 @@ from .report import (
 )
 from .safety import is_blocked
 from .state import SessionStore
+from .switch_report import (
+    DEFAULT_LAST as DEFAULT_SWITCHES,
+    DEFAULT_LEDGER_PATH,
+    DEFAULT_SKEW_SECONDS,
+    DEFAULT_WINDOW_SECONDS,
+    LedgerProblem,
+    MissingRequestRecordTable,
+    NoRequestRecords,
+    SwitchReportOptions,
+    build_switch_report,
+    format_switch_report,
+    parse_timestamp,
+    switch_report_as_json,
+)
 
 PROG = "tamias-router"
 
@@ -135,6 +151,54 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="PATH",
         help="path to the SQLite file to inspect",
     )
+
+    switch = sub.add_parser(
+        "switch-report",
+        help=(
+            "correlate approved switches with the ledger rows recorded around the "
+            "same time (read-only, by time only)"
+        ),
+    )
+    switch.add_argument(
+        "--ledger",
+        type=Path,
+        default=DEFAULT_LEDGER_PATH,
+        metavar="PATH",
+        help=f"Observer ledger to read (default: {DEFAULT_LEDGER_PATH})",
+    )
+    switch.add_argument(
+        "--since",
+        default=None,
+        metavar="ISO_TIMESTAMP",
+        help="only switches at or after this UTC timestamp, e.g. 2026-10-01T00:00:00Z",
+    )
+    switch.add_argument(
+        "--last",
+        type=int,
+        default=DEFAULT_SWITCHES,
+        metavar="N",
+        help=f"how many approved switches to show, newest first (default {DEFAULT_SWITCHES})",
+    )
+    switch.add_argument(
+        "--window-seconds",
+        type=int,
+        default=DEFAULT_WINDOW_SECONDS,
+        metavar="SECONDS",
+        help=f"how far after a switch to look (default {DEFAULT_WINDOW_SECONDS})",
+    )
+    switch.add_argument(
+        "--skew-seconds",
+        type=int,
+        default=DEFAULT_SKEW_SECONDS,
+        metavar="SECONDS",
+        help=f"how far before a switch to look (default {DEFAULT_SKEW_SECONDS})",
+    )
+    switch.add_argument(
+        "--json",
+        dest="as_json",
+        action="store_true",
+        help="print one JSON object instead of the text report",
+    )
     return parser
 
 
@@ -219,6 +283,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "ledger-info":
         return _ledger_info(args.ledger)
+
+    if args.cmd == "switch-report":
+        return _switch_report(args)
 
     config = load_config_or_exit(args.config)
 
@@ -319,6 +386,61 @@ def _ledger_info(path: Path) -> int:
         print(f"{PROG}: {exc}", file=sys.stderr)
         return 1
     print(format_ledger(path, tables))
+    return 0
+
+
+def _switch_report(args: argparse.Namespace) -> int:
+    """Correlate approved switches with the ledger, by time alone.
+
+    An absent or empty ledger is not a failure: there is simply nothing to
+    correlate with, and the message says what to do about it. A ledger that is
+    not a request-record store at all is a failure.
+    """
+    for flag, value, least in (
+        ("--last", args.last, 1),
+        ("--window-seconds", args.window_seconds, 0),
+        ("--skew-seconds", args.skew_seconds, 0),
+    ):
+        if value < least:
+            print(f"{PROG}: {flag} must be {least} or more, got {value}", file=sys.stderr)
+            return 2
+
+    since = None
+    if args.since is not None:
+        since = parse_timestamp(args.since)
+        if since is None:
+            print(
+                f"{PROG}: --since expected a UTC ISO-8601 timestamp like "
+                f"2026-10-01T00:00:00Z, got {args.since!r}",
+                file=sys.stderr,
+            )
+            return 2
+
+    router_database = default_db_path()
+    if not router_database.is_file():
+        print(f"{NOTHING_RECORDED} (no database at {router_database})")
+        return 0
+
+    options = SwitchReportOptions(
+        ledger=args.ledger,
+        window_seconds=args.window_seconds,
+        skew_seconds=args.skew_seconds,
+        last=args.last,
+        since=since,
+    )
+    try:
+        report = build_switch_report(router_database, options)
+    except NoRequestRecords as exc:
+        print(str(exc))
+        return 0
+    except MissingRequestRecordTable as exc:
+        print(f"{PROG}: {exc}", file=sys.stderr)
+        return 1
+    except (LedgerProblem, ReadOnlyError) as exc:
+        print(f"{PROG}: {exc}", file=sys.stderr)
+        return 1
+
+    print(switch_report_as_json(report) if args.as_json else format_switch_report(report))
     return 0
 
 

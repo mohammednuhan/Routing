@@ -6,6 +6,14 @@ response content. There is deliberately no column for prompt text, source code,
 tool arguments, assistant text or headers, and none may be added - see
 `FORBIDDEN_COLUMN_TOKENS`, which the tests check against the live schema.
 
+Two tables live here. `router_decisions` is one row per request. `router_usage`
+is one row per `/v1/messages` *response*, holding the token counts the upstream
+reported, what those counts cost at the config's list prices, and what they
+would have cost on the requested model. It has no content columns either: token
+counts and prices are metadata, and nothing else is stored. The table is created
+with `CREATE TABLE IF NOT EXISTS`, so adding it touches no existing table and no
+existing row.
+
 A session hint is a truncated, salted SHA-256 of the first user message. The
 text is read in memory to compute the digest and is then discarded; only the
 16-character digest is stored. The salt is random per install and lives beside
@@ -43,6 +51,14 @@ SALT_FILENAME = "router.salt"
 
 #: Only this route is logged. Everything else is forwarded and not recorded.
 MESSAGES_PATH = "/v1/messages"
+
+#: The table one row per response goes into. Named here so `router/cost_report.py`
+#: and the tests refer to one definition.
+USAGE_TABLE = "router_usage"
+
+#: Usage statuses. Mirrors `router/usage.py`; kept as literals because this
+#: module must not import the parser to check a CHECK constraint.
+USAGE_STATUSES: tuple[str, ...] = ("OK", "UNKNOWN", "NO_USAGE")
 
 #: Used when no session hint can be computed.
 UNKNOWN_SESSION = "unknown"
@@ -96,6 +112,55 @@ CREATE TABLE IF NOT EXISTS router_decisions (
 
 CREATE INDEX IF NOT EXISTS router_decisions_session
     ON router_decisions (session_hint, request_index_in_session);
+"""
+
+#: One row per `/v1/messages` response. Every numeric column is nullable: a
+#: count nobody reported stays NULL and is never written as 0. `cost_usd` and
+#: `baseline_cost_usd` are NULL for UNKNOWN, never 0.0. `decision_id` links to
+#: the request row and is NULL when the decision row could not be written.
+#:
+#: Added after `router_decisions` existed, so it is created additively and
+#: touches no existing table, column or row. `status` is constrained so a row
+#: cannot claim to be something the extractor cannot produce.
+USAGE_SCHEMA = f"""
+CREATE TABLE IF NOT EXISTS {USAGE_TABLE} (
+    usage_id           INTEGER PRIMARY KEY,
+    decision_id        INTEGER,
+    model_reported     TEXT,
+    input_tokens       INTEGER,
+    output_tokens      INTEGER,
+    cache_read_tokens  INTEGER,
+    cache_write_tokens INTEGER,
+    status             TEXT    NOT NULL CHECK (status IN {USAGE_STATUSES!r},
+    cost_usd           REAL,
+    baseline_cost_usd  REAL,
+    notes              TEXT
+);
+
+CREATE INDEX IF NOT EXISTS router_usage_decision
+    ON {USAGE_TABLE} (decision_id);
+"""
+
+_USAGE_COLUMNS = (
+    "usage_id",
+    "decision_id",
+    "model_reported",
+    "input_tokens",
+    "output_tokens",
+    "cache_read_tokens",
+    "cache_write_tokens",
+    "status",
+    "cost_usd",
+    "baseline_cost_usd",
+    "notes",
+)
+
+_USAGE_INSERT = f"""
+INSERT INTO {USAGE_TABLE} (
+    decision_id, model_reported, input_tokens, output_tokens,
+    cache_read_tokens, cache_write_tokens, status, cost_usd, baseline_cost_usd,
+    notes
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 _COLUMNS = (
@@ -241,6 +306,52 @@ class DecisionRow:
     action: str
     applied: int
     error: str | None
+
+
+@dataclass(frozen=True)
+class UsageRow:
+    """One usage row to append, one per `/v1/messages` response.
+
+    Counts and prices only. `notes` carries codes such as `MODEL_MISMATCH`, never
+    a model id that is not already a column and never anything from a response
+    body. An unknown figure is None and stays NULL: 0.0 means "this was free",
+    which is a different claim from "nobody knows what this cost".
+    """
+
+    status: str
+    decision_id: int | None = None
+    model_reported: str | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    cache_read_tokens: int | None = None
+    cache_write_tokens: int | None = None
+    cost_usd: float | None = None
+    baseline_cost_usd: float | None = None
+    notes: str | None = None
+
+
+@dataclass(frozen=True)
+class StoredUsage:
+    """One usage row as read back."""
+
+    usage_id: int
+    decision_id: int | None
+    model_reported: str | None
+    input_tokens: int | None
+    output_tokens: int | None
+    cache_read_tokens: int | None
+    cache_write_tokens: int | None
+    status: str
+    cost_usd: float | None
+    baseline_cost_usd: float | None
+    notes: str | None
+
+    @property
+    def note_codes(self) -> list[str]:
+        """The note codes on this row."""
+        if not self.notes:
+            return []
+        return [code for code in (part.strip() for part in self.notes.split(",")) if code]
 
 
 class DecisionLog:

@@ -208,7 +208,7 @@ def test_requested_and_chosen_model_are_captured(tmp_path, monkeypatch):
         assert row.applied == 0
         assert row.mode == "shadow"
         assert row.reason_codes == ["PASSTHROUGH"]
-        assert row.signal_values == {}
+        assert isinstance(row.signal_values, dict)
         assert row.error is None
         assert row.timestamp.endswith("Z")
 

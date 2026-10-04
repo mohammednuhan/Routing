@@ -38,6 +38,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 from .decisions import MESSAGES_PATH, DecisionLog, DecisionRecord, read_request_metadata
+from .signals import compute_signals
 
 #: The only host this proxy will bind. Rule 4.
 LOOPBACK_HOST = "127.0.0.1"
@@ -278,6 +279,16 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
         try:
             metadata = read_request_metadata(body)
+            signal_values: dict[str, Any] = {}
+            sig_error: str | None = None
+            try:
+                parsed = json.loads(body.decode("utf-8"))
+                sigs = compute_signals(parsed)
+                signal_values = sigs.to_dict()
+            except Exception:
+                signal_values = {}
+                sig_error = "signals_failed"
+
             record = DecisionRecord(
                 session_hint=log.session_hint(metadata.first_user_text),
                 requested_model=metadata.model,
@@ -285,10 +296,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 chosen_effort=None,
                 mode=self.settings.mode,
                 reason_codes=["PASSTHROUGH"],
-                signal_values={},
+                signal_values=signal_values,
                 action="STAY",
                 applied=0,
-                error=metadata.error or error_class,
+                error=metadata.error or sig_error or error_class,
             )
             log.record(record)
         except Exception as exc:

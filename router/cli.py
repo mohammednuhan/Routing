@@ -55,6 +55,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     log = sub.add_parser("log", help="print the latest decision-log rows (metadata only)")
     log.add_argument("--last", type=int, default=10, help="how many rows to show (default 10)")
+    log.add_argument(
+        "--signals",
+        action="store_true",
+        help="print signal_values JSON of each row below the table",
+    )
     return parser
 
 
@@ -109,7 +114,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.cmd == "log":
-        return _log(args.last)
+        return _log(args.last, show_signals=getattr(args, "signals", False))
 
     config = load_config_or_exit(args.config)
 
@@ -120,7 +125,7 @@ def main(argv: list[str] | None = None) -> int:
     return _start(config, args.upstream)
 
 
-def _log(last: int) -> int:
+def _log(last: int, show_signals: bool = False) -> int:
     if last < 1:
         print(f"{PROG}: --last must be 1 or more, got {last}", file=sys.stderr)
         return 2
@@ -141,6 +146,12 @@ def _log(last: int) -> int:
         return 0
 
     print(format_rows(rows))
+    if show_signals:
+        import json
+
+        for row in rows:
+            print(f"\n{id if False else ''}signals for decision_id={row.decision_id}:")
+            print(json.dumps(row.signal_values, indent=2, sort_keys=True))
     return 0
 
 

@@ -45,3 +45,15 @@ models:
 
 default_model: TODO_MODEL_TIER_MID
 default_effort: TODO_EFFORT_MEDIUM
+
+# Policy thresholds for shadow-mode observation only. While `mode` is `shadow`
+# these values only decide what is reported; no request is ever changed.
+policy:
+  # Escalate when this many tool results in a row were errors.
+  escalate_consecutive_errors: 2
+  # Escalate when one tool is called this many times in a row.
+  escalate_repeated_tool_calls: 3
+  # Downgrade on small, clean contexts.
+  downgrade_enabled: true
+  downgrade_max_context_tokens: 2000
+  downgrade_max_turn_index: 1

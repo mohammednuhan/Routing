@@ -38,7 +38,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 from .decisions import MESSAGES_PATH, DecisionLog, DecisionRecord, read_request_metadata
-from .signals import compute_signals
+from .signals import Signals, compute_signals
+from .policy import decide
 
 #: The only host this proxy will bind. Rule 4.
 LOOPBACK_HOST = "127.0.0.1"
@@ -154,6 +155,7 @@ class ProxySettings:
     timeout: float = DEFAULT_UPSTREAM_TIMEOUT
     mode: str = "shadow"
     decisions: DecisionLog | None = None
+    config: Any | None = None
 
 
 class _RequestError(Exception):
@@ -279,27 +281,56 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
         try:
             metadata = read_request_metadata(body)
+
             signal_values: dict[str, Any] = {}
             sig_error: str | None = None
+            signals: Signals | None = None
             try:
                 parsed = json.loads(body.decode("utf-8"))
-                sigs = compute_signals(parsed)
-                signal_values = sigs.to_dict()
+                signals = compute_signals(parsed)
+                signal_values = signals.to_dict()
             except Exception:
                 signal_values = {}
                 sig_error = "signals_failed"
 
+            action = "STAY"
+            chosen_model = metadata.model
+            chosen_effort: str | None = None
+            reason_codes = ["PASSTHROUGH"]
+            record_error = metadata.error or sig_error or error_class
+
+            config = self.settings.config
+            if signals is not None and config is not None:
+                requested_model = metadata.model or config.default_model
+                try:
+                    decision = decide(
+                        signals,
+                        requested_model,
+                        signals.requested_effort_if_present,
+                        config,
+                    )
+                    action = decision.action
+                    chosen_model = decision.target_model or requested_model
+                    chosen_effort = decision.target_effort
+                    reason_codes = list(decision.reason_codes or reason_codes)
+                except Exception:
+                    action = "STAY"
+                    chosen_model = metadata.model
+                    chosen_effort = None
+                    reason_codes = ["PASSTHROUGH"]
+                    record_error = record_error or "policy_failed"
+
             record = DecisionRecord(
                 session_hint=log.session_hint(metadata.first_user_text),
                 requested_model=metadata.model,
-                chosen_model=metadata.model,
-                chosen_effort=None,
+                chosen_model=chosen_model,
+                chosen_effort=chosen_effort,
                 mode=self.settings.mode,
-                reason_codes=["PASSTHROUGH"],
+                reason_codes=reason_codes,
                 signal_values=signal_values,
-                action="STAY",
+                action=action,
                 applied=0,
-                error=metadata.error or sig_error or error_class,
+                error=record_error,
             )
             log.record(record)
         except Exception as exc:

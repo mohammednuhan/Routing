@@ -88,6 +88,8 @@ def format_rows(rows: list[DecisionRow]) -> str:
             return "-"
         if isinstance(value, list):
             return ",".join(str(item) for item in value) or "-"
+        if field == "action" and value == "SWITCH" and getattr(row, "applied", 0) == 0:
+            return "would SWITCH"
         return str(value)
 
     header = [label for label, _ in LOG_COLUMNS]
@@ -166,6 +168,7 @@ def _start(config: RouterConfig, upstream_override: str | None) -> int:
             upstream=upstream,
             mode=config.mode,
             decisions=decisions,
+            config=config,
         )
     except ProxyError as exc:
         print(f"{PROG}: invalid upstream: {exc}", file=sys.stderr)

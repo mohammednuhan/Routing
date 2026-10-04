@@ -1,4 +1,4 @@
-"""Load and validate router/config.yaml.
+﻿"""Load and validate router/config.yaml.
 
 Validation is strict and fails closed: anything the config file does not
 establish is an error, never a default and never a guess. This module makes no
@@ -45,6 +45,17 @@ class ModelSpec:
 
 
 @dataclass(frozen=True)
+class PolicySpec:
+    """Policy parameters."""
+
+    escalate_consecutive_errors: int
+    escalate_repeated_tool_calls: int
+    downgrade_enabled: bool
+    downgrade_max_context_tokens: int
+    downgrade_max_turn_index: int
+
+
+@dataclass(frozen=True)
 class RouterConfig:
     """A validated router configuration."""
 
@@ -55,6 +66,7 @@ class RouterConfig:
     models: tuple[ModelSpec, ...]
     default_model: str
     default_effort: str
+    policy: PolicySpec | None = None
     source: Path | None = None
 
     @property
@@ -117,6 +129,8 @@ def load_config(path: Path | None = None) -> RouterConfig:
     default_model = _require_str(data, "default_model", where)
     default_effort = _require_str(data, "default_effort", where)
 
+    policy = _parse_policy(data, where)
+
     by_id = {spec.id: spec for spec in models}
     if default_model not in by_id:
         raise ConfigError(
@@ -138,6 +152,7 @@ def load_config(path: Path | None = None) -> RouterConfig:
         models=models,
         default_model=default_model,
         default_effort=default_effort,
+        policy=policy,
         source=source,
     )
 
@@ -225,3 +240,38 @@ def _parse_model(raw: Any, index: int) -> ModelSpec:
             efforts.append(effort)
 
     return ModelSpec(id=model_id, legal_efforts=tuple(efforts), cost_tier=cost_tier)
+
+
+def _parse_policy(data: dict[str, Any], where: str) -> PolicySpec | None:
+    if "policy" not in data:
+        return None
+    policy = data["policy"]
+    if not isinstance(policy, dict):
+        raise ConfigError(f"{where} key 'policy' must be a mapping")
+    known = {
+        "escalate_consecutive_errors",
+        "escalate_repeated_tool_calls",
+        "downgrade_enabled",
+        "downgrade_max_context_tokens",
+        "downgrade_max_turn_index",
+    }
+    for k in policy:
+        if k not in known:
+            raise ConfigError(f"unknown policy key {k!r}")
+    def pos_int(key: str) -> int:
+        v = policy.get(key)
+        if not isinstance(v, int) or isinstance(v, bool):
+            raise ConfigError(f"policy {key!r} must be a positive integer, got {v!r}")
+        if v <= 0:
+            raise ConfigError(f"policy {key!r} must be a positive integer, got {v!r}")
+        return v
+    downgrade_enabled = policy.get("downgrade_enabled")
+    if not isinstance(downgrade_enabled, bool):
+        raise ConfigError(f"policy 'downgrade_enabled' must be boolean, got {downgrade_enabled!r}")
+    return PolicySpec(
+        escalate_consecutive_errors=pos_int("escalate_consecutive_errors"),
+        escalate_repeated_tool_calls=pos_int("escalate_repeated_tool_calls"),
+        downgrade_enabled=downgrade_enabled,
+        downgrade_max_context_tokens=pos_int("downgrade_max_context_tokens"),
+        downgrade_max_turn_index=pos_int("downgrade_max_turn_index"),
+    )

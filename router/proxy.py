@@ -5,8 +5,13 @@ Standard library only: `http.server.ThreadingHTTPServer` for the listener,
 
 The proxy is transparent. It forwards the method, path, query, headers and body
 to the upstream named in the config and returns the upstream status, headers and
-body unchanged. It makes no routing decision, changes no model and stores
-nothing.
+body unchanged. It makes no routing decision and changes no model. The bytes it
+forwards are never altered, not even to read metadata out of them: a request
+body is parsed read-only, after the original bytes have already been sent.
+
+For `POST /v1/messages` it appends one row to the decision log: requested and
+chosen model, effort, mode, reason codes and an error class. Metadata only - see
+`router/decisions.py` and Rule 1.
 
 Streaming responses are relayed chunk by chunk as they arrive and flushed after
 each chunk; the whole response is never buffered.
@@ -31,6 +36,8 @@ import urllib.parse
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
+
+from .decisions import MESSAGES_PATH, DecisionLog, DecisionRecord, read_request_metadata
 
 #: The only host this proxy will bind. Rule 4.
 LOOPBACK_HOST = "127.0.0.1"
@@ -144,6 +151,8 @@ class ProxySettings:
     listen_port: int = 8787
     upstream: str = ""
     timeout: float = DEFAULT_UPSTREAM_TIMEOUT
+    mode: str = "shadow"
+    decisions: DecisionLog | None = None
 
 
 class _RequestError(Exception):
@@ -206,12 +215,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
         started = time.monotonic()
         status = 502
         sent_head = False
+        body = b""
+        error_class: str | None = None
         connection: http.client.HTTPConnection | None = None
         try:
             try:
                 body = self._read_request_body()
             except _RequestError as exc:
                 status = exc.status
+                error_class = "malformed_request"
                 self._reply_json(exc.status, exc.code, exc.message)
                 sent_head = True
                 self.close_connection = True
@@ -235,10 +247,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
             sent_head = True
         except TimeoutError:
             status = 504
+            error_class = "upstream_timeout"
             if not sent_head:
                 self._reply_json(504, "upstream_timeout", "the upstream did not respond in time")
         except (OSError, http.client.HTTPException):
             status = 502
+            error_class = "upstream_unreachable"
             if not sent_head:
                 self._reply_json(502, "upstream_unreachable", "the upstream could not be reached")
             else:
@@ -246,7 +260,43 @@ class ProxyHandler(BaseHTTPRequestHandler):
         finally:
             if connection is not None:
                 connection.close()
+            self._record_decision(body, status, error_class)
             self._log_request(status, started)
+
+    def _record_decision(self, body: bytes, status: int, error_class: str | None) -> None:
+        """Append one metadata-only row for a POST to /v1/messages.
+
+        Every other method and path is forwarded and not recorded. A failure
+        here is reported as one short line and never affects the request that
+        was already forwarded.
+        """
+        log = self.settings.decisions
+        if log is None or self.command != "POST":
+            return
+        if self.path.split("?", 1)[0] != MESSAGES_PATH:
+            return
+
+        try:
+            metadata = read_request_metadata(body)
+            record = DecisionRecord(
+                session_hint=log.session_hint(metadata.first_user_text),
+                requested_model=metadata.model,
+                chosen_model=metadata.model,
+                chosen_effort=None,
+                mode=self.settings.mode,
+                reason_codes=["PASSTHROUGH"],
+                signal_values={},
+                action="STAY",
+                applied=0,
+                error=metadata.error or error_class,
+            )
+            log.record(record)
+        except Exception as exc:
+            print(
+                f"tamias-router: decision log write failed ({type(exc).__name__})",
+                file=sys.stderr,
+                flush=True,
+            )
 
     def _read_request_body(self) -> bytes:
         encoding = self.headers.get("Transfer-Encoding", "")

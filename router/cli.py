@@ -15,6 +15,8 @@ from pathlib import Path
 from .config import DEFAULT_CONFIG_PATH, RouterConfig, load_config_or_exit
 from .decisions import DecisionLog, DecisionRow
 from .proxy import ProxyError, ProxySettings, parse_upstream, serve
+from .safety import is_blocked
+from .state import SessionStore
 
 PROG = "tamias-router"
 
@@ -88,8 +90,11 @@ def format_rows(rows: list[DecisionRow]) -> str:
             return "-"
         if isinstance(value, list):
             return ",".join(str(item) for item in value) or "-"
-        if field == "action" and value == "SWITCH" and getattr(row, "applied", 0) == 0:
-            return "would SWITCH"
+        if field == "action":
+            if is_blocked(row.reason_codes):
+                return "blocked"
+            if value == "SWITCH" and getattr(row, "applied", 0) == 0:
+                return "would SWITCH"
         return str(value)
 
     header = [label for label, _ in LOG_COLUMNS]
@@ -169,6 +174,7 @@ def _start(config: RouterConfig, upstream_override: str | None) -> int:
             mode=config.mode,
             decisions=decisions,
             config=config,
+            state=SessionStore(),
         )
     except ProxyError as exc:
         print(f"{PROG}: invalid upstream: {exc}", file=sys.stderr)

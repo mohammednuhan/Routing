@@ -40,6 +40,8 @@ from typing import Any
 from .decisions import MESSAGES_PATH, DecisionLog, DecisionRecord, read_request_metadata
 from .signals import Signals, compute_signals
 from .policy import decide
+from .safety import COST_SIGNAL_KEY, apply_safety, safety_failure
+from .state import SessionStore
 
 #: The only host this proxy will bind. Rule 4.
 LOOPBACK_HOST = "127.0.0.1"
@@ -156,6 +158,7 @@ class ProxySettings:
     mode: str = "shadow"
     decisions: DecisionLog | None = None
     config: Any | None = None
+    state: SessionStore | None = None
 
 
 class _RequestError(Exception):
@@ -300,6 +303,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             record_error = metadata.error or sig_error or error_class
 
             config = self.settings.config
+            session_hint = log.session_hint(metadata.first_user_text)
             if signals is not None and config is not None:
                 requested_model = metadata.model or config.default_model
                 try:
@@ -309,10 +313,30 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         signals.requested_effort_if_present,
                         config,
                     )
+                    store = self.settings.state
+                    if store is not None:
+                        decision, safety_failed = self._apply_safety(
+                            decision, signals, store, session_hint, config
+                        )
+                        if safety_failed:
+                            record_error = record_error or "safety_failed"
                     action = decision.action
-                    chosen_model = decision.target_model or requested_model
-                    chosen_effort = decision.target_effort
+                    # A blocked switch is a STAY, so the model actually in use
+                    # is the requested one. Reporting the blocked target here
+                    # would claim a model the router did not choose.
+                    chosen_model = (
+                        (decision.target_model or requested_model)
+                        if action == "SWITCH"
+                        else requested_model
+                    )
+                    chosen_effort = (
+                        decision.target_effort
+                        if action == "SWITCH"
+                        else signals.requested_effort_if_present
+                    )
                     reason_codes = list(decision.reason_codes or reason_codes)
+                    if decision.estimated_rebuild_cost_usd is not None:
+                        signal_values[COST_SIGNAL_KEY] = decision.estimated_rebuild_cost_usd
                 except Exception:
                     action = "STAY"
                     chosen_model = metadata.model
@@ -321,7 +345,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     record_error = record_error or "policy_failed"
 
             record = DecisionRecord(
-                session_hint=log.session_hint(metadata.first_user_text),
+                session_hint=session_hint,
                 requested_model=metadata.model,
                 chosen_model=chosen_model,
                 chosen_effort=chosen_effort,
@@ -339,6 +363,29 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 file=sys.stderr,
                 flush=True,
             )
+
+    def _apply_safety(
+        self,
+        decision: Any,
+        signals: Signals,
+        store: SessionStore,
+        session_hint: str,
+        config: Any,
+    ) -> tuple[Any, bool]:
+        """Run the safety layer and return `(decision, failed)`.
+
+        Safety can only remove a switch, so a failure here can only cost the
+        router a switch: the request has already been forwarded untouched and
+        nothing below touches it. A failure is recorded as STAY with
+        `SAFETY_ERROR`, never dropped and never applied.
+        """
+        try:
+            current = store.observe(session_hint)
+            final, updated = apply_safety(decision, signals, current, config)
+            store.replace(session_hint, updated)
+            return (final, False)
+        except Exception:
+            return (safety_failure(decision), True)
 
     def _read_request_body(self) -> bytes:
         encoding = self.headers.get("Transfer-Encoding", "")

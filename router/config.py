@@ -37,22 +37,39 @@ class ConfigError(Exception):
 
 @dataclass(frozen=True)
 class ModelSpec:
-    """One legal model: its id, the efforts legal for it, and its cost tier."""
+    """One legal model: its id, the efforts legal for it, and its cost tier.
+
+    The cache prices are optional and default to None. None means "unknown",
+    never zero: a switch whose cost cannot be computed is blocked, not allowed.
+    """
 
     id: str
     legal_efforts: tuple[str, ...]
     cost_tier: str
+    cache_write_per_million: float | None = None
+    cache_read_per_million: float | None = None
 
 
 @dataclass(frozen=True)
 class PolicySpec:
-    """Policy parameters."""
+    """Policy parameters.
+
+    The fields below `hysteresis_requests` govern the safety layer, which can
+    only BLOCK a switch. None of them can cause one.
+    """
 
     escalate_consecutive_errors: int
     escalate_repeated_tool_calls: int
     downgrade_enabled: bool
     downgrade_max_context_tokens: int
     downgrade_max_turn_index: int
+    dwell_requests: int = 5
+    hysteresis_requests: int = 3
+    safety_margin_usd: float = 0.0
+    escalate_benefit_usd: float | None = None
+    downgrade_benefit_usd: float | None = None
+    cost_check_enabled: bool = True
+    block_in_tool_loop: bool = False
 
 
 @dataclass(frozen=True)
@@ -239,7 +256,29 @@ def _parse_model(raw: Any, index: int) -> ModelSpec:
         if effort not in efforts:
             efforts.append(effort)
 
-    return ModelSpec(id=model_id, legal_efforts=tuple(efforts), cost_tier=cost_tier)
+    return ModelSpec(
+        id=model_id,
+        legal_efforts=tuple(efforts),
+        cost_tier=cost_tier,
+        cache_write_per_million=_parse_price(data, "cache_write_per_million", where),
+        cache_read_per_million=_parse_price(data, "cache_read_per_million", where),
+    )
+
+
+def _parse_price(data: dict[str, Any], key: str, where: str) -> float | None:
+    """A per-million price: a non-negative number, or null for "unknown".
+
+    Absent and null both mean unknown. A string is rejected rather than parsed,
+    so a price can never be a number that nobody verified.
+    """
+    value = data.get(key)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ConfigError(f"{where} key {key!r} must be a number or null, got {value!r}")
+    if value < 0:
+        raise ConfigError(f"{where} key {key!r} must not be negative, got {value!r}")
+    return float(value)
 
 
 def _parse_policy(data: dict[str, Any], where: str) -> PolicySpec | None:
@@ -254,10 +293,18 @@ def _parse_policy(data: dict[str, Any], where: str) -> PolicySpec | None:
         "downgrade_enabled",
         "downgrade_max_context_tokens",
         "downgrade_max_turn_index",
+        "dwell_requests",
+        "hysteresis_requests",
+        "safety_margin_usd",
+        "escalate_benefit_usd",
+        "downgrade_benefit_usd",
+        "cost_check_enabled",
+        "block_in_tool_loop",
     }
     for k in policy:
         if k not in known:
             raise ConfigError(f"unknown policy key {k!r}")
+
     def pos_int(key: str) -> int:
         v = policy.get(key)
         if not isinstance(v, int) or isinstance(v, bool):
@@ -265,6 +312,23 @@ def _parse_policy(data: dict[str, Any], where: str) -> PolicySpec | None:
         if v <= 0:
             raise ConfigError(f"policy {key!r} must be a positive integer, got {v!r}")
         return v
+
+    def flag(key: str, default: bool) -> bool:
+        v = policy.get(key, default)
+        if not isinstance(v, bool):
+            raise ConfigError(f"policy {key!r} must be boolean, got {v!r}")
+        return v
+
+    def amount(key: str, default: float | None) -> float | None:
+        v = policy.get(key, default)
+        if v is None:
+            return None
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            raise ConfigError(f"policy {key!r} must be a number or null, got {v!r}")
+        if v < 0:
+            raise ConfigError(f"policy {key!r} must not be negative, got {v!r}")
+        return float(v)
+
     downgrade_enabled = policy.get("downgrade_enabled")
     if not isinstance(downgrade_enabled, bool):
         raise ConfigError(f"policy 'downgrade_enabled' must be boolean, got {downgrade_enabled!r}")
@@ -274,4 +338,11 @@ def _parse_policy(data: dict[str, Any], where: str) -> PolicySpec | None:
         downgrade_enabled=downgrade_enabled,
         downgrade_max_context_tokens=pos_int("downgrade_max_context_tokens"),
         downgrade_max_turn_index=pos_int("downgrade_max_turn_index"),
+        dwell_requests=pos_int("dwell_requests"),
+        hysteresis_requests=pos_int("hysteresis_requests"),
+        safety_margin_usd=float(amount("safety_margin_usd", 0.0) or 0.0),
+        escalate_benefit_usd=amount("escalate_benefit_usd", None),
+        downgrade_benefit_usd=amount("downgrade_benefit_usd", None),
+        cost_check_enabled=flag("cost_check_enabled", True),
+        block_in_tool_loop=flag("block_in_tool_loop", False),
     )

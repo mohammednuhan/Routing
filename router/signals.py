@@ -24,6 +24,8 @@ class Signals:
     turn_index: int | None = None
     has_thinking_enabled: bool | None = None
     requested_effort_if_present: str | None = None
+    tool_use_pending: bool | None = None
+    in_tool_loop: bool | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -44,6 +46,38 @@ def _get(obj: Any, key: str, default: Any = None) -> Any:
     return default
 
 
+def last_message_tool_state(messages: Any) -> tuple[bool | None, bool | None]:
+    """`(tool_use_pending, in_tool_loop)` for the final message.
+
+    Both are None when the conversation cannot be examined at all, which is not
+    the same as False: an undeterminable signal must never be read as "no tool
+    is pending". Only block *types* are inspected; no block text is read or kept.
+    """
+    if not isinstance(messages, list) or not messages:
+        return (None, None)
+    last = messages[-1]
+    if not isinstance(last, dict):
+        return (None, None)
+    content = _get(last, "content")
+    if not isinstance(content, list):
+        # A plain-text message carries no tool blocks of either kind.
+        return (False, False)
+
+    has_result = any(
+        isinstance(block, dict) and _get(block, "type") == "tool_result" for block in content
+    )
+    has_use = any(
+        isinstance(block, dict) and _get(block, "type") == "tool_use" for block in content
+    )
+    if has_result:
+        return (False, True)
+    if has_use and _get(last, "role") == "assistant":
+        # The tool call is the last thing in the conversation, so no
+        # tool_result can follow it.
+        return (True, False)
+    return (False, False)
+
+
 def compute_signals(body_json: Any) -> Signals:
     """Compute signals from parsed request body."""
     try:
@@ -61,6 +95,10 @@ def compute_signals(body_json: Any) -> Signals:
             pass
 
         messages = _get(body_json, "messages")
+        pending, in_loop = last_message_tool_state(messages)
+        signals = dataclasses_replace(
+            signals, tool_use_pending=pending, in_tool_loop=in_loop
+        )
         if isinstance(messages, list):
             signals = dataclasses_replace(signals, message_count=len(messages))
             try:

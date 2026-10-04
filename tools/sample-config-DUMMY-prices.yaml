@@ -1,0 +1,88 @@
+# DUMMY VALUES, NOT REAL PRICES
+#
+# This is a copy of router/config.yaml whose only purpose is to let the test
+# suite exercise the safety cost checks. Every number below is invented for
+# testing and describes nothing real.
+#
+# Do not point the router at a real upstream with this file. Do not copy these
+# prices into router/config.yaml. The shipped config keeps its prices null
+# precisely because no verified price sheet exists yet, and a null price blocks a
+# switch rather than assuming it is free.
+#
+# The dummy numbers are:
+#   cache_write_per_million: 3.75     for every model
+#   cache_read_per_million:  0.30     for every model
+#   escalate_benefit_usd:    0.001
+#   downgrade_benefit_usd:   0.001
+#
+# Model ids and effort values are still the same TODO placeholders as the shipped
+# config; they were never real either.
+#
+# mode is shadow, as everywhere: nothing here can change a request.
+
+listen: 127.0.0.1:8787
+upstream: https://api.anthropic.com
+
+# Default is `shadow`. Never start in `active`.
+mode: shadow
+
+models:
+  - id: TODO_MODEL_TIER_LOW
+    legal_efforts:
+      - TODO_EFFORT_LOW
+      - TODO_EFFORT_MEDIUM
+      - TODO_EFFORT_HIGH
+    cost_tier: low
+    # DUMMY VALUES, NOT REAL PRICES
+    cache_write_per_million: 3.75
+    cache_read_per_million: 0.30
+  - id: TODO_MODEL_TIER_MID
+    legal_efforts:
+      - TODO_EFFORT_LOW
+      - TODO_EFFORT_MEDIUM
+      - TODO_EFFORT_HIGH
+    cost_tier: mid
+    # DUMMY VALUES, NOT REAL PRICES
+    cache_write_per_million: 3.75
+    cache_read_per_million: 0.30
+  - id: TODO_MODEL_TIER_HIGH
+    legal_efforts:
+      - TODO_EFFORT_LOW
+      - TODO_EFFORT_MEDIUM
+      - TODO_EFFORT_HIGH
+    cost_tier: high
+    # DUMMY VALUES, NOT REAL PRICES
+    cache_write_per_million: 3.75
+    cache_read_per_million: 0.30
+
+default_model: TODO_MODEL_TIER_MID
+default_effort: TODO_EFFORT_MEDIUM
+
+# Identical to the shipped policy block. Only the prices and the two benefit
+# figures differ, and those differ from the shipped file by being non-null.
+policy:
+  # Escalate when this many tool results in a row were errors.
+  escalate_consecutive_errors: 2
+  # Escalate when one tool is called this many times in a row.
+  escalate_repeated_tool_calls: 3
+  # Downgrade on small, clean contexts.
+  downgrade_enabled: true
+  downgrade_max_context_tokens: 2000
+  downgrade_max_turn_index: 1
+  # Safety layer. These can only BLOCK a switch; none of them can cause one.
+  # A blocked switch is recorded as STAY with applied=0 and a BLOCKED_* reason.
+  #
+  # Minimum requests between allowed switches within one session.
+  dwell_requests: 5
+  # A reversal must be proposed this many requests in a row before it is allowed.
+  hysteresis_requests: 3
+  # Extra headroom, in USD, required on top of the estimated rebuild cost.
+  safety_margin_usd: 0.0
+  # Estimated benefit of an escalation, USD. DUMMY VALUES, NOT REAL PRICES.
+  escalate_benefit_usd: 0.001
+  # Estimated benefit of a downgrade, USD. DUMMY VALUES, NOT REAL PRICES.
+  downgrade_benefit_usd: 0.001
+  # When false, the cost check is skipped entirely.
+  cost_check_enabled: true
+  # When true, block any switch while the latest message is a tool_result.
+  block_in_tool_loop: false

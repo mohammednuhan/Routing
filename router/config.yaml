@@ -30,18 +30,36 @@ models:
       - TODO_EFFORT_MEDIUM
       - TODO_EFFORT_HIGH
     cost_tier: low
+    # TODO(owner): cache price per million tokens. Null means UNKNOWN, not zero.
+    # Leave null until a dated price sheet supplies real figures; a switch whose
+    # cost cannot be computed is blocked, never allowed on an assumed price.
+    # For a dummy-priced copy for testing only, see tools/sample-config-DUMMY-prices.yaml.
+    cache_write_per_million: null
+    cache_read_per_million: null
   - id: TODO_MODEL_TIER_MID
     legal_efforts:
       - TODO_EFFORT_LOW
       - TODO_EFFORT_MEDIUM
       - TODO_EFFORT_HIGH
     cost_tier: mid
+    # TODO(owner): cache price per million tokens. Null means UNKNOWN, not zero.
+    # Leave null until a dated price sheet supplies real figures; a switch whose
+    # cost cannot be computed is blocked, never allowed on an assumed price.
+    # For a dummy-priced copy for testing only, see tools/sample-config-DUMMY-prices.yaml.
+    cache_write_per_million: null
+    cache_read_per_million: null
   - id: TODO_MODEL_TIER_HIGH
     legal_efforts:
       - TODO_EFFORT_LOW
       - TODO_EFFORT_MEDIUM
       - TODO_EFFORT_HIGH
     cost_tier: high
+    # TODO(owner): cache price per million tokens. Null means UNKNOWN, not zero.
+    # Leave null until a dated price sheet supplies real figures; a switch whose
+    # cost cannot be computed is blocked, never allowed on an assumed price.
+    # For a dummy-priced copy for testing only, see tools/sample-config-DUMMY-prices.yaml.
+    cache_write_per_million: null
+    cache_read_per_million: null
 
 default_model: TODO_MODEL_TIER_MID
 default_effort: TODO_EFFORT_MEDIUM
@@ -57,3 +75,20 @@ policy:
   downgrade_enabled: true
   downgrade_max_context_tokens: 2000
   downgrade_max_turn_index: 1
+  # Safety layer. These can only BLOCK a switch; none of them can cause one.
+  # A blocked switch is recorded as STAY with applied=0 and a BLOCKED_* reason.
+  #
+  # Minimum requests between allowed switches within one session.
+  dwell_requests: 5
+  # A reversal must be proposed this many requests in a row before it is allowed.
+  hysteresis_requests: 3
+  # Extra headroom, in USD, required on top of the estimated rebuild cost.
+  safety_margin_usd: 0.0
+  # Estimated benefit of an escalation, USD. Null means unknown, which blocks.
+  escalate_benefit_usd: null
+  # Estimated benefit of a downgrade, USD. Null means unknown, which blocks.
+  downgrade_benefit_usd: null
+  # When false, the cost check is skipped entirely.
+  cost_check_enabled: true
+  # When true, block any switch while the latest message is a tool_result.
+  block_in_tool_loop: false

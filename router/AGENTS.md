@@ -75,6 +75,26 @@ value, and never falls back to one that is not in the config. Model ids in the
 shipped config are placeholders; replacing them requires a verified id with a
 source and an access date.
 
+### Rule 8 — Definition of done
+
+The full test suite is green. Never report done with failing tests.
+
+A change that leaves any test failing is not finished, not "done pending
+review", and not "done except one known failure". Fix the cause or report the
+blocker plainly. A test that cannot be made to pass is raised as a question
+with the exact assertion quoted, never edited away.
+
+### Rule 9 — `config.yaml` edits are additive
+
+`config.yaml` edits are additive; never regenerate it programmatically, and
+comments must survive.
+
+The comments in `router/config.yaml` carry the placeholder warnings that Rule 7
+depends on. Round-tripping the file through a YAML dumper such as
+`yaml.safe_dump` silently discards every one of them, so the file must be edited
+by hand: add or adjust the specific lines that need to change and leave every
+other line, comment included, exactly as it was.
+
 ---
 
 ## How this code enforces the rules
@@ -86,6 +106,8 @@ source and an access date.
 | 3 | `load_config_or_exit` exits non-zero instead of guessing; the pass-through path itself is not implemented yet. |
 | 4 | `parse_listen` in `router/config.py` rejects any host other than `LEGAL_LISTEN_HOST` (`127.0.0.1`). |
 | 7 | `load_config` rejects a `default_model` not in `models` and a `default_effort` not in that model's `legal_efforts`; `RouterConfig.is_legal` is the only membership test. |
+| 8 | Definition of done, not a runtime check: the suite is run in full before any change is reported as finished. |
+| 9 | `router/config.yaml` is hand-edited, never written by `yaml.safe_dump`; `tools/sample-config-DUMMY-prices.yaml` exists so tests never need the shipped file rewritten to carry dummy numbers. |
 
 ## Current state
 

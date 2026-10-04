@@ -10,12 +10,37 @@ from .signals import Signals
 
 @dataclass(frozen=True)
 class Decision:
-    """Routing decision."""
+    """Routing decision.
+
+    `direction` is "up", "down" or None and is recorded here so that the safety
+    layer can rate-limit switches without re-deriving the tiers. `policy` owns
+    it; only the safety layer reads it.
+
+    `estimated_rebuild_cost_usd` is set by the safety layer, not here, and is a
+    number or the string "UNKNOWN". None means the cost was never evaluated.
+    """
 
     action: str  # "STAY" or "SWITCH"
     target_model: str | None = None
     target_effort: str | None = None
     reason_codes: list[str] | None = None
+    direction: str | None = None
+    estimated_rebuild_cost_usd: float | str | None = None
+
+
+def _direction_for(specs: list[ModelSpec], source: str, target: str | None) -> str | None:
+    """Which way a switch from `source` to `target` goes."""
+    if target is None:
+        return None
+    source_tier = _tier_order_for(specs, source)
+    target_tier = _tier_order_for(specs, target)
+    if source_tier is None or target_tier is None:
+        return None
+    if target_tier > source_tier:
+        return "up"
+    if target_tier < source_tier:
+        return "down"
+    return None
 
 
 def _tier_order_for(specs: list[ModelSpec], model_id: str) -> int | None:
@@ -93,8 +118,8 @@ def decide(signals: Signals, requested_model: str, requested_effort: str | None,
         if target_effort is not None and not config.is_legal(target_model, target_effort):
             return Decision(action="STAY", target_model=requested_model, target_effort=requested_effort, reason_codes=["ILLEGAL_PAIR"])
         if target_effort is None:
-            return Decision(action="SWITCH", target_model=target_model, target_effort=None, reason_codes=["ESCALATE_TOOL_ERRORS"])
-        return Decision(action="SWITCH", target_model=target_model, target_effort=target_effort, reason_codes=["ESCALATE_TOOL_ERRORS"])
+            return Decision(action="SWITCH", target_model=target_model, target_effort=None, reason_codes=["ESCALATE_TOOL_ERRORS"], direction=_direction_for(specs_list, requested_model, target_model))
+        return Decision(action="SWITCH", target_model=target_model, target_effort=target_effort, reason_codes=["ESCALATE_TOOL_ERRORS"], direction=_direction_for(specs_list, requested_model, target_model))
     if signals.repeated_tool_call_count is not None and signals.repeated_tool_call_count >= policy.escalate_repeated_tool_calls:
         higher = _next_higher(specs_list, requested_model)
         if higher is None:
@@ -104,8 +129,8 @@ def decide(signals: Signals, requested_model: str, requested_effort: str | None,
         if target_effort is not None and not config.is_legal(target_model, target_effort):
             return Decision(action="STAY", target_model=requested_model, target_effort=requested_effort, reason_codes=["ILLEGAL_PAIR"])
         if target_effort is None:
-            return Decision(action="SWITCH", target_model=target_model, target_effort=None, reason_codes=["ESCALATE_REPEATED_TOOLS"])
-        return Decision(action="SWITCH", target_model=target_model, target_effort=target_effort, reason_codes=["ESCALATE_REPEATED_TOOLS"])
+            return Decision(action="SWITCH", target_model=target_model, target_effort=None, reason_codes=["ESCALATE_REPEATED_TOOLS"], direction=_direction_for(specs_list, requested_model, target_model))
+        return Decision(action="SWITCH", target_model=target_model, target_effort=target_effort, reason_codes=["ESCALATE_REPEATED_TOOLS"], direction=_direction_for(specs_list, requested_model, target_model))
     if policy.downgrade_enabled:
         if (signals.context_tokens_estimate is not None and signals.turn_index is not None and signals.consecutive_tool_errors is not None):
             if (signals.context_tokens_estimate <= policy.downgrade_max_context_tokens and
@@ -119,8 +144,8 @@ def decide(signals: Signals, requested_model: str, requested_effort: str | None,
                 if target_effort is not None and not config.is_legal(target_model, target_effort):
                     return Decision(action="STAY", target_model=requested_model, target_effort=requested_effort, reason_codes=["ILLEGAL_PAIR"])
                 if target_effort is None:
-                    return Decision(action="SWITCH", target_model=target_model, target_effort=None, reason_codes=["DOWNGRADE_SMALL_CONTEXT"])
-                return Decision(action="SWITCH", target_model=target_model, target_effort=target_effort, reason_codes=["DOWNGRADE_SMALL_CONTEXT"])
+                    return Decision(action="SWITCH", target_model=target_model, target_effort=None, reason_codes=["DOWNGRADE_SMALL_CONTEXT"], direction=_direction_for(specs_list, requested_model, target_model))
+                return Decision(action="SWITCH", target_model=target_model, target_effort=target_effort, reason_codes=["DOWNGRADE_SMALL_CONTEXT"], direction=_direction_for(specs_list, requested_model, target_model))
         else:
             return Decision(action="STAY", target_model=requested_model, target_effort=requested_effort, reason_codes=["NO_RULE_MATCHED", "SIGNAL_UNKNOWN"])
     return Decision(action="STAY", target_model=requested_model, target_effort=requested_effort, reason_codes=["NO_RULE_MATCHED"])

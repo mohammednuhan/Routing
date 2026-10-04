@@ -1,0 +1,13 @@
+# Python
+.venv
+__pycache__
+.pytest_cache
+build
+dist
+*.egg-info
+
+# local SQLite state: an artifact, not source
+*.sqlite3
+
+# secrets
+.env

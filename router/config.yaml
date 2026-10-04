@@ -1,0 +1,47 @@
+# tamias-router configuration.
+#
+# TODO(owner): every model id and effort value below is a PLACEHOLDER.
+# TODO(owner): no real provider model id is recorded here on purpose. Inventing
+#   one would be fabricated provider behavior. Replace each entry with a
+#   verified id (plus its source and access date) before `mode` is anything
+#   other than `shadow`.
+# TODO(owner): the cost tiers below are ordinal labels used for comparison
+#   inside this file only. They are not prices and not provider tiers. Once real
+#   ids are in place, tiers must be derived from dated price sheets.
+#
+# mode:
+#   shadow - observe only; every request is passed through unchanged (default)
+#   active - apply the router's decision (not implemented yet)
+#   off    - router disabled; every request is passed through unchanged
+#
+# listen must be 127.0.0.1. A non-loopback listen address is rejected at load
+# time, not warned about.
+
+listen: 127.0.0.1:8787
+upstream: https://api.anthropic.com
+
+# Default is `shadow`. Never start in `active`.
+mode: shadow
+
+models:
+  - id: TODO_MODEL_TIER_LOW
+    legal_efforts:
+      - TODO_EFFORT_LOW
+      - TODO_EFFORT_MEDIUM
+      - TODO_EFFORT_HIGH
+    cost_tier: low
+  - id: TODO_MODEL_TIER_MID
+    legal_efforts:
+      - TODO_EFFORT_LOW
+      - TODO_EFFORT_MEDIUM
+      - TODO_EFFORT_HIGH
+    cost_tier: mid
+  - id: TODO_MODEL_TIER_HIGH
+    legal_efforts:
+      - TODO_EFFORT_LOW
+      - TODO_EFFORT_MEDIUM
+      - TODO_EFFORT_HIGH
+    cost_tier: high
+
+default_model: TODO_MODEL_TIER_MID
+default_effort: TODO_EFFORT_MEDIUM

@@ -4,6 +4,8 @@ Standard library only. Routes:
 
     POST /echo         -> {"ok": true, "received_bytes": N}
     POST /sink         -> "ok", after recording the request
+    POST /v1/messages  -> {"ok", "received_bytes", "content_length", "model",
+                            "effort", "stream", "messages"}
     GET  /static       -> a fixed non-streaming body
     GET  /stream       -> 3 SSE chunks, one per second, chunked
     GET  /status/<n>   -> HTTP <n> with a small body
@@ -32,6 +34,21 @@ STREAM_CHUNKS = [
     b"data: {\"index\": 2}\n\n",
 ]
 CHUNK_INTERVAL_SECONDS = 1.0
+
+
+def _effort_of(payload: dict[str, object]) -> object:
+    """The effort a request asked for, as the API expresses it.
+
+    `effort` may be a plain field or the budget of a `thinking` block. Anything
+    unexpected yields None rather than a guess.
+    """
+    direct = payload.get("effort")
+    if direct is not None:
+        return direct
+    thinking = payload.get("thinking")
+    if isinstance(thinking, dict):
+        return thinking.get("budget_tokens")
+    return None
 
 
 class MockUpstreamHandler(BaseHTTPRequestHandler):
@@ -91,7 +108,38 @@ class MockUpstreamHandler(BaseHTTPRequestHandler):
         if self.route == "/sink":
             self._send(200, b"ok\n", "text/plain")
             return
+        if self.route == "/v1/messages":
+            self._messages(body)
+            return
         self._send(404, b"mock upstream: no such route\n", "text/plain")
+
+    def _messages(self, body: bytes) -> None:
+        """Report what a `/v1/messages` request carried, as JSON.
+
+        Echoes only metadata plus the fields a router would act on (`model`,
+        `effort`, `stream`) and their received length. The message list is not
+        returned: an upstream that echoed prompts would make this tool a place
+        where request content is stored.
+        """
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except ValueError:
+            payload = None
+
+        report: dict[str, object] = {
+            "ok": True,
+            "received_bytes": len(body),
+            "content_length": self.headers.get("Content-Length"),
+        }
+        if isinstance(payload, dict):
+            report["model"] = payload.get("model")
+            report["effort"] = _effort_of(payload)
+            report["stream"] = payload.get("stream")
+            report["messages"] = len(payload.get("messages") or [])
+        else:
+            report["json"] = False
+
+        self._send(200, json.dumps(report).encode(), "application/json")
 
     def _stream(self) -> None:
         self.send_response(200)

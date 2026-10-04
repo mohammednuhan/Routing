@@ -11,17 +11,28 @@
 #
 # mode:
 #   shadow - observe only; every request is passed through unchanged (default)
-#   active - apply the router's decision (not implemented yet)
+#   active - apply the router's decision. `start` refuses to run active while
+#           any model id below is still a `TODO_` placeholder.
 #   off    - router disabled; every request is passed through unchanged
 #
 # listen must be 127.0.0.1. A non-loopback listen address is rejected at load
 # time, not warned about.
+#
+# routed_header:
+#   false - never announce a hop (default)
+#   true  - add `X-Tamias-Routed: <requested>-><chosen>` to a response, but only
+#           when a request body was actually rewritten. In shadow and off the
+#           header is never sent, whatever this is set to.
 
 listen: 127.0.0.1:8787
 upstream: https://api.anthropic.com
 
 # Default is `shadow`. Never start in `active`.
 mode: shadow
+
+# Announce an applied hop on the response. Off by default: a header that names
+# a model the router did not actually use would be a false claim.
+routed_header: false
 
 models:
   - id: TODO_MODEL_TIER_LOW

@@ -20,6 +20,13 @@ from .state import SessionStore
 
 PROG = "tamias-router"
 
+#: Model ids in the shipped config are placeholders. Active mode refuses to run
+#: on one: it would rewrite requests toward a model nobody verified (Rule 7).
+PLACEHOLDER_PREFIX = "TODO_"
+
+#: Printed once at startup when active mode is allowed to run.
+ACTIVE_BANNER = "ACTIVE MODE: requests may be rewritten to other models"
+
 LOG_COLUMNS = (
     ("id", "decision_id"),
     ("timestamp", "timestamp"),
@@ -162,7 +169,34 @@ def _log(last: int, show_signals: bool = False) -> int:
     return 0
 
 
+def active_start_blocker(config: RouterConfig) -> str | None:
+    """Why `start` must refuse, or None when it may proceed.
+
+    Active mode is the only mode that can change a request, so it is the only
+    mode that is refused when the config still carries placeholder model ids.
+    Shadow and off forward every request untouched, so a placeholder there is
+    harmless and must stay loadable.
+    """
+    if config.mode != "active":
+        return None
+    placeholders = [
+        spec.id for spec in config.models if spec.id.startswith(PLACEHOLDER_PREFIX)
+    ]
+    if not placeholders:
+        return None
+    return (
+        f"refusing to start in active mode: {len(placeholders)} model id(s) are "
+        f"placeholders beginning {PLACEHOLDER_PREFIX!r}: {', '.join(placeholders)}. "
+        "Replace each with a verified id plus source and access date, or run in shadow."
+    )
+
+
 def _start(config: RouterConfig, upstream_override: str | None) -> int:
+    blocker = active_start_blocker(config)
+    if blocker is not None:
+        print(f"{PROG}: {blocker}", file=sys.stderr)
+        return 1
+
     upstream = upstream_override if upstream_override else config.upstream
     try:
         target = parse_upstream(upstream)
@@ -181,6 +215,8 @@ def _start(config: RouterConfig, upstream_override: str | None) -> int:
         return 1
 
     print(f"{PROG} start: mode={config.mode} listen={config.listen}")
+    if config.mode == "active":
+        print(ACTIVE_BANNER)
     print(f"{PROG} decisions: {decisions.db_path}")
     try:
         serve(settings)

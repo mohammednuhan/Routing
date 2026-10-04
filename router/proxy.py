@@ -37,7 +37,14 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
-from .decisions import MESSAGES_PATH, DecisionLog, DecisionRecord, read_request_metadata
+from .config import LEGAL_MODES
+from .decisions import (
+    MESSAGES_PATH,
+    DecisionLog,
+    DecisionRecord,
+    RequestMetadata,
+    read_request_metadata,
+)
 from .signals import Signals, compute_signals
 from .policy import decide
 from .safety import COST_SIGNAL_KEY, apply_safety, safety_failure
@@ -83,8 +90,187 @@ _BODYLESS_STATUSES = frozenset({204, 304})
 _DEFAULT_PORTS = {"http": 80, "https": 443}
 
 
+def _is_legal_target(config: Any, model: str) -> bool:
+    """True when `model` appears in the config's models (Rule 7).
+
+    Checks the id only. Effort is never rewritten, so there is no effort to
+    validate here.
+    """
+    models = getattr(config, "model_ids", None)
+    return isinstance(models, tuple) and model in models
+
+
 class ProxyError(Exception):
     """The proxy cannot be configured or started."""
+
+
+class NotAJSONObject(Exception):
+    """The body is not a JSON object, or has no top-level "model" to replace."""
+
+
+#: Error classes recorded when a rewrite was considered and abandoned. The
+#: original bytes are forwarded in every one of these cases.
+REWRITE_SKIPPED_ENCODING = "rewrite_skipped_encoding"
+REWRITE_SKIPPED_NOT_JSON = "rewrite_skipped_not_json"
+REWRITE_FAILED = "rewrite_failed"
+
+#: Response header naming the hop, added only when a body was actually rewritten
+#: and `routed_header` is enabled.
+ROUTED_HEADER = "X-Tamias-Routed"
+
+_WHITESPACE = " \t\r\n"
+
+
+def rewrite_model(body: bytes, target_model: str) -> bytes:
+    """Return `body` with only its top-level `"model"` value replaced.
+
+    This is a splice, not a re-serialization: every other byte of the request,
+    including key order and whitespace, is preserved exactly. Only the span
+    occupied by the model value is replaced, with the same encoding style
+    (`json.dumps` with `ensure_ascii=False`) the body itself would use.
+
+    Raises `NotAJSONObject` when the body is not a JSON object or has no
+    top-level `model`. Any other failure is the caller's to classify.
+    """
+    try:
+        text = body.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise NotAJSONObject("body is not utf-8") from exc
+
+    try:
+        payload = json.loads(text)
+    except ValueError as exc:
+        raise NotAJSONObject("body is not json") from exc
+    if not isinstance(payload, dict):
+        raise NotAJSONObject("body is not a json object")
+
+    try:
+        start, end = _top_level_value_span(text, "model")
+    except _SpanError as exc:
+        raise NotAJSONObject(f"cannot locate the top-level model value: {exc}") from exc
+
+    encoded = json.dumps(target_model, ensure_ascii=False)
+    return (text[:start] + encoded + text[end:]).encode("utf-8")
+
+
+class _SpanError(ValueError):
+    """The raw JSON text could not be walked as expected."""
+
+
+def is_rewritable(body: bytes) -> bool:
+    """True when `rewrite_model` would find a top-level `"model"` in `body`.
+
+    Used by active mode to say "this body could never have been rewritten",
+    which is a different problem from "there was nothing to rewrite".
+    """
+    try:
+        text = body.decode("utf-8")
+        payload = json.loads(text)
+    except (UnicodeDecodeError, ValueError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    try:
+        _top_level_value_span(text, "model")
+    except _SpanError:
+        return False
+    return True
+
+
+def _skip_whitespace(text: str, index: int) -> int:
+    while index < len(text) and text[index] in _WHITESPACE:
+        index += 1
+    return index
+
+
+def _value_end(text: str, start: int) -> int:
+    """The index just past the JSON value that begins at `start`."""
+    if start >= len(text):
+        raise _SpanError("value starts past the end")
+    char = text[start]
+
+    if char == '"':
+        index = start + 1
+        while index < len(text):
+            current = text[index]
+            if current == "\\":
+                index += 2
+                continue
+            if current == '"':
+                return index + 1
+            index += 1
+        raise _SpanError("unterminated string")
+
+    if char in "{[":
+        depth = 0
+        index = start
+        while index < len(text):
+            current = text[index]
+            if current == '"':
+                index = _value_end(text, index)
+                continue
+            if current in "{[":
+                depth += 1
+            elif current in "}]":
+                depth -= 1
+                if depth == 0:
+                    return index + 1
+            index += 1
+        raise _SpanError("unterminated container")
+
+    index = start
+    while index < len(text) and text[index] not in ",}]" and text[index] not in _WHITESPACE:
+        index += 1
+    if index == start:
+        raise _SpanError("empty scalar value")
+    return index
+
+
+def _top_level_value_span(text: str, key: str) -> tuple[int, int]:
+    """The `(start, end)` span of a top-level object's member value.
+
+    Walks the raw text rather than re-encoding it, so the span is exact even
+    when the request used unusual whitespace or key order.
+    """
+    index = _skip_whitespace(text, 0)
+    if index >= len(text) or text[index] != "{":
+        raise _SpanError("not a json object")
+    index += 1
+
+    while True:
+        index = _skip_whitespace(text, index)
+        if index >= len(text):
+            raise _SpanError("unterminated object")
+        if text[index] == "}":
+            raise _SpanError(f"no top-level {key!r}")
+        if text[index] != '"':
+            raise _SpanError("expected a member name")
+
+        name_start = index
+        name_end = _value_end(text, index)
+        try:
+            name = json.loads(text[name_start:name_end])
+        except ValueError as exc:
+            raise _SpanError("member name is not json") from exc
+
+        index = _skip_whitespace(text, name_end)
+        if index >= len(text) or text[index] != ":":
+            raise _SpanError("expected ':'")
+        index = _skip_whitespace(text, index + 1)
+        value_end = _value_end(text, index)
+
+        if name == key:
+            return (index, value_end)
+
+        index = _skip_whitespace(text, value_end)
+        if index >= len(text):
+            raise _SpanError("unterminated object")
+        if text[index] == ",":
+            index += 1
+            continue
+        if text[index] == "}":
+            raise _SpanError(f"no top-level {key!r}")
+        raise _SpanError("expected ',' or '}'")
 
 
 @dataclass(frozen=True)
@@ -161,6 +347,32 @@ class ProxySettings:
     state: SessionStore | None = None
 
 
+@dataclass(frozen=True)
+class RoutingPlan:
+    """Everything the router decided about one request, plus the bytes to send.
+
+    Computed before the body is forwarded, because in active mode the decision
+    has to exist before anything is sent upstream. The body forwarded is
+    `forward_body`: byte-identical to the request in every mode except an
+    allowed switch in active mode.
+    """
+
+    metadata: RequestMetadata
+    signals: Signals | None
+    sig_error: str | None
+    session_hint: str | None
+    action: str
+    chosen_model: str | None
+    chosen_effort: str | None
+    reason_codes: list[str]
+    record_error: str | None
+    estimated_cost: float | str | None
+    mode: str
+    forward_body: bytes
+    applied: int = 0
+    routed_header: str | None = None
+
+
 class _RequestError(Exception):
     """A malformed request; answered locally without touching the upstream."""
 
@@ -223,6 +435,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         sent_head = False
         body = b""
         error_class: str | None = None
+        plan: RoutingPlan | None = None
         connection: http.client.HTTPConnection | None = None
         try:
             try:
@@ -235,7 +448,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 self.close_connection = True
                 return
 
-            headers = self._forwarded_headers(body)
+            # The decision is made before anything is sent upstream, because
+            # active mode has to forward the body it intends to send. In shadow
+            # and off this returns the original bytes untouched.
+            plan = self._plan(body)
+            forward_body = plan.forward_body if plan is not None else body
+
+            headers = self._forwarded_headers(forward_body)
             connection = self.target.connect(self.settings.timeout)
             connection.putrequest(
                 self.command,
@@ -245,11 +464,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
             )
             for name, value in headers:
                 connection.putheader(name, value)
-            connection.endheaders(body if body else None)
+            connection.endheaders(forward_body if forward_body else None)
 
             response = connection.getresponse()
             status = response.status
-            self._relay(response)
+            self._relay(response, plan.routed_header if plan is not None else None)
             sent_head = True
         except TimeoutError:
             status = 504
@@ -266,22 +485,36 @@ class ProxyHandler(BaseHTTPRequestHandler):
         finally:
             if connection is not None:
                 connection.close()
-            self._record_decision(body, status, error_class)
+            self._record_decision(body, status, error_class, plan)
             self._log_request(status, started)
 
-    def _record_decision(self, body: bytes, status: int, error_class: str | None) -> None:
-        """Append one metadata-only row for a POST to /v1/messages.
+    @property
+    def _effective_mode(self) -> str:
+        """The mode that governs both the recorded row and any rewrite.
 
-        Every other method and path is forwarded and not recorded. A failure
-        here is reported as one short line and never affects the request that
-        was already forwarded.
+        The config is authoritative when it carries a legal mode, so a row can
+        never claim one mode while the body was forwarded under another. Only
+        `active` rewrites; every other mode forwards the original bytes.
         """
-        log = self.settings.decisions
-        if log is None or self.command != "POST":
-            return
-        if self.path.split("?", 1)[0] != MESSAGES_PATH:
-            return
+        config = self.settings.config
+        configured = getattr(config, "mode", None) if config is not None else None
+        if isinstance(configured, str) and configured in LEGAL_MODES:
+            return configured
+        return self.settings.mode
 
+    def _plan(self, body: bytes) -> RoutingPlan | None:
+        """Decide what to do with one request. Never raises, never prints.
+
+        Returns None when the request is not one this router records or routes.
+        Any failure inside degrades to "forward the original bytes", because a
+        decision that could not be made must never become a change.
+        """
+        if self.command != "POST":
+            return None
+        if self.path.split("?", 1)[0] != MESSAGES_PATH:
+            return None
+
+        mode = self._effective_mode
         try:
             metadata = read_request_metadata(body)
 
@@ -300,10 +533,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
             chosen_model = metadata.model
             chosen_effort: str | None = None
             reason_codes = ["PASSTHROUGH"]
-            record_error = metadata.error or sig_error or error_class
+            record_error = metadata.error or sig_error
+            estimated_cost: float | str | None = None
+            session_hint: str | None = None
+            decision: Any = None
+            safety_ran = False
 
+            log = self.settings.decisions
             config = self.settings.config
-            session_hint = log.session_hint(metadata.first_user_text)
+
             if signals is not None and config is not None:
                 requested_model = metadata.model or config.default_model
                 try:
@@ -314,10 +552,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         config,
                     )
                     store = self.settings.state
-                    if store is not None:
+                    if store is not None and log is not None:
+                        session_hint = log.session_hint(metadata.first_user_text)
                         decision, safety_failed = self._apply_safety(
                             decision, signals, store, session_hint, config
                         )
+                        safety_ran = not safety_failed
                         if safety_failed:
                             record_error = record_error or "safety_failed"
                     action = decision.action
@@ -335,25 +575,156 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         else signals.requested_effort_if_present
                     )
                     reason_codes = list(decision.reason_codes or reason_codes)
-                    if decision.estimated_rebuild_cost_usd is not None:
-                        signal_values[COST_SIGNAL_KEY] = decision.estimated_rebuild_cost_usd
+                    estimated_cost = decision.estimated_rebuild_cost_usd
+                    if estimated_cost is not None:
+                        signal_values[COST_SIGNAL_KEY] = estimated_cost
                 except Exception:
+                    decision = None
                     action = "STAY"
                     chosen_model = metadata.model
                     chosen_effort = None
                     reason_codes = ["PASSTHROUGH"]
                     record_error = record_error or "policy_failed"
 
-            record = DecisionRecord(
+            forward_body = body
+            applied = 0
+            routed_header: str | None = None
+
+            if mode == "active":
+                # Active mode reports why it did not rewrite, so an operator can
+                # tell "nothing to do" apart from "could not have".
+                encoding = self.headers.get("Content-Encoding", "").strip().lower()
+                if encoding and encoding != "identity":
+                    record_error = REWRITE_SKIPPED_ENCODING
+                elif not is_rewritable(body):
+                    record_error = REWRITE_SKIPPED_NOT_JSON
+                elif action == "SWITCH":
+                    # Only a switch safety actually approved may be applied.
+                    # Without a session there is no safety, and an unchecked
+                    # switch is not one (Rule 2).
+                    if safety_ran:
+                        forward_body, rewrite_error = self._rewrite_for_active(
+                            body, decision, config
+                        )
+                        if rewrite_error is None:
+                            applied = 1
+                            if getattr(config, "routed_header", False):
+                                routed_header = (
+                                    f"{metadata.model or ''}->{chosen_model or ''}"
+                                )
+                        else:
+                            record_error = rewrite_error
+
+            return RoutingPlan(
+                metadata=metadata,
+                signals=signals,
+                sig_error=sig_error,
                 session_hint=session_hint,
-                requested_model=metadata.model,
+                action=action,
                 chosen_model=chosen_model,
                 chosen_effort=chosen_effort,
-                mode=self.settings.mode,
                 reason_codes=reason_codes,
-                signal_values=signal_values,
-                action=action,
+                record_error=record_error,
+                estimated_cost=estimated_cost,
+                mode=mode,
+                forward_body=forward_body,
+                applied=applied,
+                routed_header=routed_header,
+            )
+        except Exception:
+            # Nothing above may prevent the request from being forwarded.
+            return RoutingPlan(
+                metadata=RequestMetadata(error="router_plan_failed"),
+                signals=None,
+                sig_error=None,
+                session_hint=None,
+                action="STAY",
+                chosen_model=None,
+                chosen_effort=None,
+                reason_codes=["PASSTHROUGH"],
+                record_error="router_plan_failed",
+                estimated_cost=None,
+                mode=mode,
+                forward_body=body,
                 applied=0,
+                routed_header=None,
+            )
+
+    def _rewrite_for_active(
+        self, body: bytes, decision: Any, config: Any
+    ) -> tuple[bytes, str | None]:
+        """The bytes to forward in active mode, and any rewrite error class.
+
+        Returns the original body untouched whenever the rewrite cannot be done
+        safely. Forwarding is never blocked by this.
+        """
+        target = getattr(decision, "target_model", None)
+        if not isinstance(target, str) or not _is_legal_target(config, target):
+            # A target outside the config is never forwarded, whatever decided
+            # it (Rule 7).
+            return (body, REWRITE_FAILED)
+
+        try:
+            rewritten = rewrite_model(body, target)
+        except NotAJSONObject:
+            return (body, REWRITE_SKIPPED_NOT_JSON)
+        except Exception:
+            return (body, REWRITE_FAILED)
+
+        if rewritten == body:
+            return (body, REWRITE_FAILED)
+        return (rewritten, None)
+
+    def _record_decision(
+        self,
+        body: bytes,
+        status: int,
+        error_class: str | None,
+        plan: RoutingPlan | None = None,
+    ) -> None:
+        """Append one metadata-only row for a POST to /v1/messages.
+
+        Every other method and path is forwarded and not recorded. A failure
+        here is reported as one short line and never affects the request, which
+        has already been forwarded by the time this runs.
+
+        `plan` is the decision computed before forwarding. It is recomputed
+        only when it is absent, which happens for a request rejected before its
+        body was read.
+        """
+        log = self.settings.decisions
+        if log is None or self.command != "POST":
+            return
+        if self.path.split("?", 1)[0] != MESSAGES_PATH:
+            return
+
+        if plan is None:
+            plan = self._plan(body)
+            if plan is None:
+                return
+
+        try:
+            signal_values: dict[str, Any] = {}
+            if plan.signals is not None:
+                signal_values = plan.signals.to_dict()
+            if plan.estimated_cost is not None:
+                signal_values[COST_SIGNAL_KEY] = plan.estimated_cost
+
+            record_error = plan.record_error or error_class
+            session_hint = plan.session_hint
+            if session_hint is None:
+                session_hint = log.session_hint(plan.metadata.first_user_text)
+
+            record = DecisionRecord(
+                session_hint=session_hint,
+                requested_model=plan.metadata.model,
+                chosen_model=plan.chosen_model,
+                chosen_effort=plan.chosen_effort,
+                mode=plan.mode,
+                reason_codes=plan.reason_codes,
+                signal_values=signal_values,
+                action=plan.action,
+                applied=plan.applied,
                 error=record_error,
             )
             log.record(record)
@@ -375,9 +746,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
         """Run the safety layer and return `(decision, failed)`.
 
         Safety can only remove a switch, so a failure here can only cost the
-        router a switch: the request has already been forwarded untouched and
-        nothing below touches it. A failure is recorded as STAY with
-        `SAFETY_ERROR`, never dropped and never applied.
+        router a switch, never gain one: `safety_failure` turns the decision
+        into a STAY, and because this runs before anything is forwarded, a
+        STAY means the original bytes are what go upstream. A failure is
+        recorded as an error class, never dropped and never applied.
         """
         try:
             current = store.observe(session_hint)
@@ -470,14 +842,27 @@ class ProxyHandler(BaseHTTPRequestHandler):
             headers.append(("Content-Length", "0"))
         return headers
 
-    def _relay(self, response: http.client.HTTPResponse) -> None:
-        """Send the upstream status and headers, then stream the body through."""
+    def _relay(
+        self, response: http.client.HTTPResponse, routed_header: str | None = None
+    ) -> None:
+        """Send the upstream status and headers, then stream the body through.
+
+        `routed_header` is emitted only when a body was actually rewritten and
+        the config asked for it, so the header can never claim a hop that did
+        not happen.
+        """
         self.send_response(response.status, response.reason)
         for name, value in response.getheaders():
             key = name.lower()
             if key in HOP_BY_HOP_HEADERS or key.startswith("proxy-"):
                 continue
+            if key == ROUTED_HEADER.lower():
+                # The router owns this header: an upstream copy of it would be a
+                # claim about a hop the upstream knows nothing about.
+                continue
             self.send_header(name, value)
+        if routed_header is not None:
+            self.send_header(ROUTED_HEADER, routed_header)
 
         bodyless = (
             self.command == "HEAD"

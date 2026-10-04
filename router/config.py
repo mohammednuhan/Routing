@@ -84,6 +84,7 @@ class RouterConfig:
     default_model: str
     default_effort: str
     policy: PolicySpec | None = None
+    routed_header: bool = False
     source: Path | None = None
 
     @property
@@ -145,6 +146,7 @@ def load_config(path: Path | None = None) -> RouterConfig:
     models = _parse_models(_require_key(data, "models", where))
     default_model = _require_str(data, "default_model", where)
     default_effort = _require_str(data, "default_effort", where)
+    routed_header = _parse_flag(data, "routed_header", where)
 
     policy = _parse_policy(data, where)
 
@@ -170,6 +172,7 @@ def load_config(path: Path | None = None) -> RouterConfig:
         default_model=default_model,
         default_effort=default_effort,
         policy=policy,
+        routed_header=routed_header,
         source=source,
     )
 
@@ -215,6 +218,16 @@ def _require_str(mapping: dict[str, Any], key: str, where: str) -> str:
     value = _require_key(mapping, key, where)
     if not isinstance(value, str) or not value.strip():
         raise ConfigError(f"{where} key {key!r} must be a non-empty string, got {value!r}")
+    return value
+
+
+def _parse_flag(data: dict[str, Any], key: str, where: str) -> bool:
+    """An optional top-level boolean. Absent means false, never true."""
+    if key not in data:
+        return False
+    value = data[key]
+    if not isinstance(value, bool):
+        raise ConfigError(f"{where} key {key!r} must be boolean, got {value!r}")
     return value
 
 

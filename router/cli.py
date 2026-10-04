@@ -1,7 +1,8 @@
 """tamias-router command line: `status` and `start`.
 
 `status` reads the config and prints it. It makes no network calls. `start`
-does not run a proxy yet and does not read the config.
+validates the config and runs the transparent loopback proxy; it makes no
+routing decision and changes no model.
 """
 from __future__ import annotations
 
@@ -10,6 +11,7 @@ import sys
 from pathlib import Path
 
 from .config import DEFAULT_CONFIG_PATH, RouterConfig, load_config_or_exit
+from .proxy import ProxyError, ProxySettings, parse_upstream, serve
 
 PROG = "tamias-router"
 
@@ -27,7 +29,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="cmd")
     sub.add_parser("status", help="print mode, listen address, upstream, defaults (no network)")
-    sub.add_parser("start", help="start the proxy (not implemented yet)")
+    start = sub.add_parser("start", help="run the transparent proxy")
+    start.add_argument(
+        "--upstream",
+        default=None,
+        help="override the upstream URL from the config (for testing against a mock)",
+    )
     return parser
 
 
@@ -55,12 +62,35 @@ def main(argv: list[str] | None = None) -> int:
         parser.print_help()
         return 0
 
-    if args.cmd == "start":
-        print("proxy not implemented yet")
+    config = load_config_or_exit(args.config)
+
+    if args.cmd == "status":
+        print(format_status(config))
         return 0
 
-    config = load_config_or_exit(args.config)
-    print(format_status(config))
+    return _start(config, args.upstream)
+
+
+def _start(config: RouterConfig, upstream_override: str | None) -> int:
+    upstream = upstream_override if upstream_override else config.upstream
+    try:
+        target = parse_upstream(upstream)
+        settings = ProxySettings(
+            listen_host=config.listen_host,
+            listen_port=config.listen_port,
+            upstream=upstream,
+        )
+    except ProxyError as exc:
+        print(f"{PROG}: invalid upstream: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"{PROG} start: mode={config.mode} listen={config.listen}")
+    try:
+        serve(settings)
+    except OSError as exc:
+        print(f"{PROG}: cannot listen on {config.listen}: {exc}", file=sys.stderr)
+        return 1
+    print(f"{PROG}: stopped (upstream was {target.safe_label})")
     return 0
 
 

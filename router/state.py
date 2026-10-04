@@ -1,15 +1,21 @@
 """In-memory per-session state for the safety layer.
 
 Safety needs to remember, per session, how many requests it has seen, when it
-last allowed a switch, and which way that switch went. That is a small amount of
-metadata and it is held here, in memory, for the life of the process.
+last allowed a switch, which way that switch went, and which model that switch
+chose. That is a small amount of metadata and it is held here, in memory, for
+the life of the process.
+
+`held_model` is the model an allowed switch picked, kept so that the requests
+which follow it - which arrive naming the ORIGINAL model, because the client
+never learns it was moved - can stay on it. `held_from_model` is the model the
+client is still asking for, and `held_requests` counts the requests the hold
+has served. All three are a model id, a model id and a counter. Rule 1 applies
+to them exactly as it applies to the rest: there is no field here for a
+message, a prompt, tool arguments or a header, and none may be added.
 
 It is deliberately NOT persisted. A restart forgets every session, which can
 only make the router more willing to switch, never less; the safety layer fails
 open to STAY on its own checks but never to "assume a switch happened".
-
-Rule 1 applies: nothing here is request content. There is no field for a
-message, a prompt, tool arguments or a header, and none may be added.
 
 Thread safety: a `ThreadingHTTPServer` runs one handler thread per connection,
 so every mutation happens under one lock and every value handed out is a copy.
@@ -42,6 +48,10 @@ class SessionState:
     last_switch_request_index: int | None = None
     last_switch_direction: str | None = None
     opposite_streak: int = 0
+    switch_count: int = 0
+    held_model: str | None = None
+    held_from_model: str | None = None
+    held_requests: int = 0
 
     @property
     def requests_since_last_switch(self) -> int | None:
@@ -51,13 +61,42 @@ class SessionState:
         return self.requests_seen - self.last_switch_request_index
 
     def recorded_switch(self, direction: str) -> SessionState:
-        """A copy that records an allowed switch in `direction`."""
+        """A copy that records an allowed switch in `direction`.
+
+        `switch_count` only ever counts switches that were allowed and applied,
+        so the per-session cap counts changes the router actually made.
+        """
         return replace(
             self,
             last_switch_request_index=self.requests_seen,
             last_switch_direction=direction,
             opposite_streak=0,
+            switch_count=self.switch_count + 1,
         )
+
+    def recorded_hold(self, target_model: str, from_model: str) -> SessionState:
+        """A copy that holds `target_model` on behalf of a switch from `from_model`.
+
+        Recorded next to an allowed switch, and nowhere else: a hold is the
+        memory of a switch that was approved, not a decision of its own. It
+        never touches `switch_count`, `last_switch_request_index` or
+        `last_switch_direction`, because serving the hold is not a new switch
+        and must not look like one to dwell or to the per-session cap.
+        """
+        return replace(
+            self,
+            held_model=target_model,
+            held_from_model=from_model,
+            held_requests=0,
+        )
+
+    def released_hold(self) -> SessionState:
+        """A copy with no hold. The counter goes with it."""
+        return replace(self, held_model=None, held_from_model=None, held_requests=0)
+
+    @property
+    def has_hold(self) -> bool:
+        return self.held_model is not None
 
 
 class SessionStore:

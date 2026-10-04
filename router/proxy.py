@@ -33,18 +33,28 @@ import json
 import sys
 import time
 import urllib.parse
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
+from .breaker import (
+    DEFAULT_COOLDOWN_SECONDS,
+    DEFAULT_THRESHOLD,
+    REASON_CIRCUIT_OPEN,
+    CircuitBreaker,
+    is_internal_error,
+)
 from .config import LEGAL_MODES
 from .decisions import (
     MESSAGES_PATH,
     DecisionLog,
     DecisionRecord,
     RequestMetadata,
+    default_db_path,
     read_request_metadata,
 )
+from .killswitch import REASON_KILL_SWITCH, read_kill_switch
+from .hold import HELD_SIGNAL_KEY, apply_hold
 from .signals import Signals, compute_signals
 from .policy import decide
 from .safety import COST_SIGNAL_KEY, apply_safety, safety_failure
@@ -345,6 +355,7 @@ class ProxySettings:
     decisions: DecisionLog | None = None
     config: Any | None = None
     state: SessionStore | None = None
+    breaker: CircuitBreaker | None = None
 
 
 @dataclass(frozen=True)
@@ -371,6 +382,7 @@ class RoutingPlan:
     forward_body: bytes
     applied: int = 0
     routed_header: str | None = None
+    held_requests: int | None = None
 
 
 class _RequestError(Exception):
@@ -489,6 +501,44 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._log_request(status, started)
 
     @property
+    def _db_path(self) -> Any:
+        """Where the kill switch's flag file lives."""
+        log = self.settings.decisions
+        return log.db_path if log is not None else default_db_path()
+
+    def _passthrough_plan(self, body: bytes, reason: str) -> RoutingPlan:
+        """The plan for a request the router is not allowed to change.
+
+        Used by the kill switch and by an open circuit. The bytes are the ones
+        that arrived, the row is written with `reason`, and `mode` is `off` so
+        the log says the request was handled as if the router were disabled.
+
+        Any hold for this session is released: while the router is not deciding,
+        a hold would be a claim about a request it never evaluated.
+        """
+        try:
+            metadata = read_request_metadata(body)
+        except Exception:
+            metadata = RequestMetadata(error="router_plan_failed")
+        self._release_hold(metadata)
+        return RoutingPlan(
+            metadata=metadata,
+            signals=None,
+            sig_error=None,
+            session_hint=None,
+            action="STAY",
+            chosen_model=metadata.model,
+            chosen_effort=None,
+            reason_codes=[reason],
+            record_error=metadata.error,
+            estimated_cost=None,
+            mode="off",
+            forward_body=body,
+            applied=0,
+            routed_header=None,
+        )
+
+    @property
     def _effective_mode(self) -> str:
         """The mode that governs both the recorded row and any rewrite.
 
@@ -514,6 +564,17 @@ class ProxyHandler(BaseHTTPRequestHandler):
         if self.path.split("?", 1)[0] != MESSAGES_PATH:
             return None
 
+        # The kill switch and the breaker are checked here, per request, so
+        # neither needs a restart and neither can be missed by a code path that
+        # forgets to look. Both pass the request straight through.
+        switch = read_kill_switch(self._db_path)
+        if switch.on:
+            return self._passthrough_plan(body, REASON_KILL_SWITCH)
+
+        breaker = self.settings.breaker
+        if breaker is not None and breaker.is_open():
+            return self._passthrough_plan(body, REASON_CIRCUIT_OPEN)
+
         mode = self._effective_mode
         try:
             metadata = read_request_metadata(body)
@@ -535,6 +596,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             reason_codes = ["PASSTHROUGH"]
             record_error = metadata.error or sig_error
             estimated_cost: float | str | None = None
+            held_requests: int | None = None
             session_hint: str | None = None
             decision: Any = None
             safety_ran = False
@@ -554,12 +616,22 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     store = self.settings.state
                     if store is not None and log is not None:
                         session_hint = log.session_hint(metadata.first_user_text)
-                        decision, safety_failed = self._apply_safety(
-                            decision, signals, store, session_hint, config
+                        decision, safety_failed, held_state = self._apply_safety(
+                            decision,
+                            signals,
+                            store,
+                            session_hint,
+                            config,
+                            requested_model,
+                            mode,
                         )
                         safety_ran = not safety_failed
                         if safety_failed:
                             record_error = record_error or "safety_failed"
+                        if held_state is not None:
+                            # Only a session holding something reports a count, so
+                            # an absent value means "no hold", not "a hold of zero".
+                            held_requests = held_state.held_requests if held_state.has_hold else None
                     action = decision.action
                     # A blocked switch is a STAY, so the model actually in use
                     # is the requested one. Reporting the blocked target here
@@ -615,6 +687,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         else:
                             record_error = rewrite_error
 
+            breaker = self.settings.breaker
+            if breaker is not None:
+                # Only requests the router actually evaluated can move the
+                # breaker. One the kill switch or an open circuit short-circuited
+                # is not evidence that the router is broken.
+                breaker.record(is_internal_error(record_error, reason_codes))
+
             return RoutingPlan(
                 metadata=metadata,
                 signals=signals,
@@ -626,6 +705,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 reason_codes=reason_codes,
                 record_error=record_error,
                 estimated_cost=estimated_cost,
+                held_requests=held_requests,
                 mode=mode,
                 forward_body=forward_body,
                 applied=applied,
@@ -644,6 +724,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 reason_codes=["PASSTHROUGH"],
                 record_error="router_plan_failed",
                 estimated_cost=None,
+                held_requests=None,
                 mode=mode,
                 forward_body=body,
                 applied=0,
@@ -709,6 +790,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 signal_values = plan.signals.to_dict()
             if plan.estimated_cost is not None:
                 signal_values[COST_SIGNAL_KEY] = plan.estimated_cost
+            if plan.held_requests is not None:
+                signal_values[HELD_SIGNAL_KEY] = plan.held_requests
 
             record_error = plan.record_error or error_class
             session_hint = plan.session_hint
@@ -735,6 +818,28 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 flush=True,
             )
 
+    def _release_hold(self, metadata: RequestMetadata) -> None:
+        """Drop this session's hold without counting the request.
+
+        Used on the paths that never reach a decision: the kill switch, an open
+        circuit and mode `off`. `store.get` rather than `store.observe`, because
+        a request the router did not evaluate must not move `requests_seen`,
+        dwell or the switch counter.
+        """
+        store = self.settings.state
+        log = self.settings.decisions
+        if store is None or log is None:
+            return
+        try:
+            hint = log.session_hint(metadata.first_user_text)
+            current = store.get(hint)
+            if current.has_hold:
+                store.replace(hint, current.released_hold())
+        except Exception:
+            # Nothing about a hold may affect the request, which is already
+            # being forwarded either way.
+            pass
+
     def _apply_safety(
         self,
         decision: Any,
@@ -742,22 +847,36 @@ class ProxyHandler(BaseHTTPRequestHandler):
         store: SessionStore,
         session_hint: str,
         config: Any,
-    ) -> tuple[Any, bool]:
-        """Run the safety layer and return `(decision, failed)`.
+        requested_model: str,
+        mode: str = "active",
+    ) -> tuple[Any, bool, SessionState | None]:
+        """Run the safety layer and the hold; return `(decision, failed, state)`.
 
         Safety can only remove a switch, so a failure here can only cost the
         router a switch, never gain one: `safety_failure` turns the decision
         into a STAY, and because this runs before anything is forwarded, a
         STAY means the original bytes are what go upstream. A failure is
         recorded as an error class, never dropped and never applied.
+
+        The hold runs afterwards, on safety's final answer, so it can only
+        replace a STAY. Nothing is stored and no hold moves when safety failed:
+        a layer that could not check the request does not get to act on it.
         """
         try:
             current = store.observe(session_hint)
             final, updated = apply_safety(decision, signals, current, config)
+            final, updated = apply_hold(
+                final,
+                requested_model,
+                signals.requested_effort_if_present,
+                updated,
+                config,
+                mode,
+            )
             store.replace(session_hint, updated)
-            return (final, False)
+            return (final, False, updated)
         except Exception:
-            return (safety_failure(decision), True)
+            return (safety_failure(decision), True, None)
 
     def _read_request_body(self) -> bytes:
         encoding = self.headers.get("Transfer-Encoding", "")
@@ -961,6 +1080,24 @@ def create_server(settings: ProxySettings) -> ProxyServer:
             f"the router listens on {LOOPBACK_HOST} only"
         )
     target = parse_upstream(settings.upstream)
+    if settings.breaker is None:
+        # Every proxy gets a breaker, so a router can never run without one by
+        # forgetting to pass it. The threshold and cooldown come from the config
+        # when it has a policy block, and from the shipped defaults otherwise.
+        policy = getattr(settings.config, "policy", None)
+        settings = replace(
+            settings,
+            breaker=CircuitBreaker(
+                threshold=getattr(
+                    policy, "breaker_error_threshold", DEFAULT_THRESHOLD
+                )
+                or DEFAULT_THRESHOLD,
+                cooldown_seconds=getattr(
+                    policy, "breaker_cooldown_seconds", DEFAULT_COOLDOWN_SECONDS
+                )
+                or DEFAULT_COOLDOWN_SECONDS,
+            ),
+        )
     return ProxyServer((settings.listen_host, settings.listen_port), ProxyHandler, settings, target)
 
 

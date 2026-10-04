@@ -103,3 +103,14 @@ policy:
   cost_check_enabled: true
   # When true, block any switch while the latest message is a tool_result.
   block_in_tool_loop: false
+  # Most switches one session may make. The (N+1)th is blocked with
+  # BLOCKED_SWITCH_CAP, checked right after dwell_requests.
+  max_switches_per_session: 10
+  # Circuit breaker. After this many CONSECUTIVE requests that failed inside
+  # the router (signals_failed, policy_failed, safety_failed, rewrite_failed),
+  # the router stops deciding anything and passes every request through
+  # unchanged for the cooldown below, logging CIRCUIT_OPEN. Any request that
+  # does not fail internally resets the count. An upstream that is down or a
+  # provider 500 does not count: the router handled those correctly.
+  breaker_error_threshold: 3
+  breaker_cooldown_seconds: 60

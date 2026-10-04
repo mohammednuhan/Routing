@@ -30,6 +30,7 @@ from .state import DOWN, UP, SessionState
 BLOCKED_TOOL_USE_PENDING = "BLOCKED_TOOL_USE_PENDING"
 BLOCKED_TOOL_LOOP = "BLOCKED_TOOL_LOOP"
 BLOCKED_DWELL = "BLOCKED_DWELL"
+BLOCKED_SWITCH_CAP = "BLOCKED_SWITCH_CAP"
 BLOCKED_HYSTERESIS = "BLOCKED_HYSTERESIS"
 BLOCKED_COST = "BLOCKED_COST"
 BLOCKED_COST_UNKNOWN = "BLOCKED_COST_UNKNOWN"
@@ -40,6 +41,7 @@ BLOCKED_CODES: tuple[str, ...] = (
     BLOCKED_TOOL_USE_PENDING,
     BLOCKED_TOOL_LOOP,
     BLOCKED_DWELL,
+    BLOCKED_SWITCH_CAP,
     BLOCKED_HYSTERESIS,
     BLOCKED_COST,
     BLOCKED_COST_UNKNOWN,
@@ -110,11 +112,17 @@ def apply_safety(
     if since is not None and since < policy.dwell_requests:
         return (_block(decision, BLOCKED_DWELL), state)
 
-    # d. Hysteresis: a reversal needs the same proposal several times running.
+    # d. Per-session cap: a session may only be moved this many times, however
+    #    long it lives. Checked after dwell so a request that is merely too
+    #    early still reports the dwell block it hit first.
+    if session_state.switch_count >= policy.max_switches_per_session:
+        return (_block(decision, BLOCKED_SWITCH_CAP), state)
+
+    # e. Hysteresis: a reversal needs the same proposal several times running.
     if _is_reversal(decision, session_state) and state.opposite_streak < policy.hysteresis_requests:
         return (_block(decision, BLOCKED_HYSTERESIS), state)
 
-    # e. Cost: allow only when the benefit clearly beats the rebuild cost.
+    # f. Cost: allow only when the benefit clearly beats the rebuild cost.
     if policy.cost_check_enabled:
         benefit = _benefit_for(policy, decision)
         target = _find_spec(config.models, decision.target_model)

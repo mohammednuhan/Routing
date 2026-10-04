@@ -30,6 +30,18 @@ LEGAL_LISTEN_HOST: str = "127.0.0.1"
 #: The config file shipped inside the package.
 DEFAULT_CONFIG_PATH: Path = Path(__file__).with_name("config.yaml")
 
+#: Consecutive internal router errors that open the circuit breaker.
+DEFAULT_BREAKER_ERROR_THRESHOLD = 3
+
+#: Seconds the breaker stays open before the router is allowed to try again.
+DEFAULT_BREAKER_COOLDOWN_SECONDS = 60
+
+#: Switches one session may make before the cap blocks the next one.
+DEFAULT_MAX_SWITCHES_PER_SESSION = 10
+
+#: Requests one model hold may serve before it is released.
+DEFAULT_HOLD_MAX_REQUESTS = 50
+
 
 class ConfigError(Exception):
     """The config file is missing, unreadable, malformed, or illegal."""
@@ -70,6 +82,10 @@ class PolicySpec:
     downgrade_benefit_usd: float | None = None
     cost_check_enabled: bool = True
     block_in_tool_loop: bool = False
+    breaker_error_threshold: int = DEFAULT_BREAKER_ERROR_THRESHOLD
+    breaker_cooldown_seconds: int = DEFAULT_BREAKER_COOLDOWN_SECONDS
+    max_switches_per_session: int = DEFAULT_MAX_SWITCHES_PER_SESSION
+    hold_max_requests: int = DEFAULT_HOLD_MAX_REQUESTS
 
 
 @dataclass(frozen=True)
@@ -313,6 +329,10 @@ def _parse_policy(data: dict[str, Any], where: str) -> PolicySpec | None:
         "downgrade_benefit_usd",
         "cost_check_enabled",
         "block_in_tool_loop",
+        "breaker_error_threshold",
+        "breaker_cooldown_seconds",
+        "max_switches_per_session",
+        "hold_max_requests",
     }
     for k in policy:
         if k not in known:
@@ -325,6 +345,16 @@ def _parse_policy(data: dict[str, Any], where: str) -> PolicySpec | None:
         if v <= 0:
             raise ConfigError(f"policy {key!r} must be a positive integer, got {v!r}")
         return v
+
+    def pos_int_or(key: str, default: int) -> int:
+        """A positive integer, or `default` when the key is absent.
+
+        Absent means the shipped default, so a config written before a key
+        existed keeps loading rather than being rejected.
+        """
+        if key not in policy:
+            return default
+        return pos_int(key)
 
     def flag(key: str, default: bool) -> bool:
         v = policy.get(key, default)
@@ -358,4 +388,16 @@ def _parse_policy(data: dict[str, Any], where: str) -> PolicySpec | None:
         downgrade_benefit_usd=amount("downgrade_benefit_usd", None),
         cost_check_enabled=flag("cost_check_enabled", True),
         block_in_tool_loop=flag("block_in_tool_loop", False),
+        breaker_error_threshold=pos_int_or(
+            "breaker_error_threshold", DEFAULT_BREAKER_ERROR_THRESHOLD
+        ),
+        breaker_cooldown_seconds=pos_int_or(
+            "breaker_cooldown_seconds", DEFAULT_BREAKER_COOLDOWN_SECONDS
+        ),
+        max_switches_per_session=pos_int_or(
+            "max_switches_per_session", DEFAULT_MAX_SWITCHES_PER_SESSION
+        ),
+        hold_max_requests=pos_int_or(
+            "hold_max_requests", DEFAULT_HOLD_MAX_REQUESTS
+        ),
     )

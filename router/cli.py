@@ -12,8 +12,16 @@ import sqlite3
 import sys
 from pathlib import Path
 
+from .breaker import REASON_CIRCUIT_OPEN
 from .config import DEFAULT_CONFIG_PATH, RouterConfig, load_config_or_exit
 from .decisions import DecisionLog, DecisionRow
+from .killswitch import (
+    KILL_SWITCH_FILENAME,
+    REASON_KILL_SWITCH,
+    KillSwitch,
+    read_kill_switch,
+    write_kill_switch,
+)
 from .proxy import ProxyError, ProxySettings, parse_upstream, serve
 from .safety import is_blocked
 from .state import SessionStore
@@ -69,13 +77,21 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="print signal_values JSON of each row below the table",
     )
+    sub.add_parser(
+        "off",
+        help="turn the kill switch on: create the router.off flag file beside the log",
+    )
+    sub.add_parser(
+        "on", help="turn the kill switch off: remove the router.off flag file"
+    )
     return parser
 
 
-def format_status(config: RouterConfig) -> str:
+def format_status(config: RouterConfig, switch: KillSwitch | None = None) -> str:
     """Render the status report. Reports configuration only, never traffic."""
     fields = (
         ("mode", config.mode),
+        ("kill_switch", format_kill_switch(switch)),
         ("listen", config.listen),
         ("upstream", config.upstream),
         ("default_model", config.default_model),
@@ -88,6 +104,13 @@ def format_status(config: RouterConfig) -> str:
     return "\n".join(lines)
 
 
+def format_kill_switch(switch: KillSwitch | None) -> str:
+    """`OFF`, or `ON` with the reason, so status never hides why."""
+    if switch is None or not switch.on:
+        return "OFF"
+    return f"ON ({switch.detail})"
+
+
 def format_rows(rows: list[DecisionRow]) -> str:
     """Render rows as a fixed-width table of metadata fields only."""
 
@@ -98,6 +121,13 @@ def format_rows(rows: list[DecisionRow]) -> str:
         if isinstance(value, list):
             return ",".join(str(item) for item in value) or "-"
         if field == "action":
+            # A kill-switch or open-circuit row is a STAY the router never
+            # chose, so label it as the reason it happened rather than as a
+            # decision. The reason column carries the code itself.
+            if REASON_KILL_SWITCH in row.reason_codes:
+                return "kill switch"
+            if REASON_CIRCUIT_OPEN in row.reason_codes:
+                return "circuit open"
             if is_blocked(row.reason_codes):
                 return "blocked"
             if value == "SWITCH" and getattr(row, "applied", 0) == 0:
@@ -127,16 +157,37 @@ def main(argv: list[str] | None = None) -> int:
         parser.print_help()
         return 0
 
+    if args.cmd in ("off", "on"):
+        return _kill_switch(args.cmd == "off")
+
     if args.cmd == "log":
         return _log(args.last, show_signals=getattr(args, "signals", False))
 
     config = load_config_or_exit(args.config)
 
     if args.cmd == "status":
-        print(format_status(config))
+        print(format_status(config, read_kill_switch(DecisionLog.from_env().db_path)))
         return 0
 
     return _start(config, args.upstream)
+
+
+def _kill_switch(on: bool) -> int:
+    """Create or remove the flag file. The running proxy sees it on the next
+    request, so no restart is involved."""
+    log = DecisionLog.from_env()
+    path = log.db_path.parent / KILL_SWITCH_FILENAME
+    try:
+        write_kill_switch(log.db_path, on)
+    except OSError as exc:
+        action = "create" if on else "remove"
+        print(f"{PROG}: cannot {action} {path}: {exc}", file=sys.stderr)
+        return 1
+    if on:
+        print(f"{PROG}: kill switch ON ({path})")
+    else:
+        print(f"{PROG}: kill switch OFF ({path} removed if it existed)")
+    return 0
 
 
 def _log(last: int, show_signals: bool = False) -> int:

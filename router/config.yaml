@@ -171,6 +171,20 @@ policy:
   # twice: once as planned, and once on the next model in the tier.
   fallback_max_attempts: 1
 
+  # Ask the upstream for an uncompressed answer. OFF by default.
+  #
+  # When true, the client's own `Accept-Encoding` is replaced with `identity` on
+  # the REQUEST the router forwards upstream, so the upstream replies in plain
+  # bytes and the token counts in that reply can be read. A compressed answer is
+  # still relayed to the client byte for byte; the router decodes its own copy
+  # for counting and never re-encodes, rewrites or forwards what it decoded.
+  #
+  # Nothing on a response is touched: no header is added or removed, no body is
+  # decompressed on the way out. What the upstream sent is what the client gets.
+  # The cost is bandwidth, which is why this is opt-in and why the shipped
+  # default is false.
+  upstream_identity_encoding: false
+
 # Rule-based task classification from the latest human prompt.
 #
 # DISABLED by default, and it must stay that way on a fresh install: while

@@ -264,6 +264,11 @@ class PolicySpec:
     in the same cost tier after the upstream answers with a retryable status.
     They are off by default, are read only in `active` mode, and cannot touch a
     request that succeeded.
+
+    `upstream_identity_encoding` asks the upstream for an uncompressed response
+    by replacing the client's `Accept-Encoding` on the forwarded request with
+    `identity`. It is off by default, is read in every mode, and says nothing
+    about a response: what the upstream sent is what the client gets.
     """
 
     escalate_consecutive_errors: int
@@ -285,6 +290,7 @@ class PolicySpec:
     fallback_enabled: bool = False
     fallback_statuses: tuple[int, ...] = DEFAULT_FALLBACK_STATUSES
     fallback_max_attempts: int = DEFAULT_FALLBACK_MAX_ATTEMPTS
+    upstream_identity_encoding: bool = False
 
 
 @dataclass(frozen=True)
@@ -581,6 +587,7 @@ def _parse_policy(data: dict[str, Any], where: str) -> PolicySpec | None:
         "fallback_enabled",
         "fallback_statuses",
         "fallback_max_attempts",
+        "upstream_identity_encoding",
     }
     for k in policy:
         if k not in known:
@@ -675,6 +682,7 @@ def _parse_policy(data: dict[str, Any], where: str) -> PolicySpec | None:
         fallback_max_attempts=pos_int_or(
             "fallback_max_attempts", DEFAULT_FALLBACK_MAX_ATTEMPTS
         ),
+        upstream_identity_encoding=flag("upstream_identity_encoding", False),
     )
 
 

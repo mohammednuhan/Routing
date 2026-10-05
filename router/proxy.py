@@ -41,6 +41,14 @@ can cost a row and nothing else.
 Streaming responses are relayed chunk by chunk as they arrive and flushed after
 each chunk; the whole response is never buffered.
 
+One request header the proxy can replace, and only when the policy says so:
+`policy.upstream_identity_encoding` turns the client's `Accept-Encoding` into
+`identity` on the forwarded upstream request, so the upstream answers in plain
+bytes and the counts in that answer can be read. It is off by default, and it is
+a request header only: nothing on a response is added, removed or decoded on the
+way out, and every other request header and the body are forwarded exactly as
+they arrived. See `upstream_identity_encoding` below.
+
 One exception to the streaming rule, and it is not an exception to transparency:
 when the policy enables it, a request the upstream answered with a retryable
 status is sent again before anything is relayed, with only the top-level `model`
@@ -156,6 +164,12 @@ REQUEST_HEADERS_DROPPED = HOP_BY_HOP_HEADERS | {"host", "content-length", "expec
 
 #: Methods whose empty body still needs an explicit `Content-Length: 0`.
 _METHODS_EXPECTING_BODY = frozenset({"POST", "PUT", "PATCH"})
+
+#: The one request header the policy can replace, and the one value it is
+#: replaced with. `identity` is the encoding that means "do not compress", so an
+#: upstream that honours it replies in plain bytes.
+ACCEPT_ENCODING = "Accept-Encoding"
+IDENTITY_ENCODING = "identity"
 
 #: Statuses that carry no body and therefore no framing headers.
 _BODYLESS_STATUSES = frozenset({204, 304})
@@ -389,6 +403,23 @@ def fallback_settings(config: Any) -> FallbackSettings:
         statuses=tuple(statuses),
         max_attempts=attempts,
     )
+
+
+def upstream_identity_encoding(config: Any) -> bool:
+    """Whether the policy asks for `Accept-Encoding: identity` on the upstream hop.
+
+    Read the way `fallback_settings` reads its own: the policy section, and only
+    `is True` ever turns the feature on. A config with no policy, a config whose
+    policy predates the key and a policy whose value is not the boolean `true`
+    all mean off, so a fresh install and an old config both forward the client's
+    own header exactly as it arrived.
+
+    The flag is not a routing decision and is not gated on the mode: it is read
+    for every request the proxy forwards, and it cannot change a model, an effort
+    or a body. Rule 2.
+    """
+    policy = getattr(config, "policy", None)
+    return getattr(policy, "upstream_identity_encoding", False) is True
 
 
 def forwarded_model(body: bytes) -> str | None:
@@ -1564,13 +1595,25 @@ class ProxyHandler(BaseHTTPRequestHandler):
         return bytes(body)
 
     def _forwarded_headers(self, body: bytes) -> list[tuple[str, str]]:
-        """Copy the client's headers, minus hop-by-hop and credential routing."""
+        """Copy the client's headers, minus hop-by-hop and credential routing.
+
+        The one header the policy can change is `Accept-Encoding`, and only when
+        `upstream_identity_encoding` is on: the client's value is dropped and
+        `identity` is sent in its place, so the upstream answers uncompressed and
+        the counts in that answer can be read. With the key absent or false -
+        which is every shipped config - the client's own value is forwarded
+        exactly as it arrived.
+
+        Every other header is copied unchanged, including the credentials the
+        client sent: they are read in memory and forwarded, never logged (Rule 5).
+        """
         connection_tokens = {
             token.strip().lower()
             for value in self.headers.get_all("Connection") or []
             for token in value.split(",")
             if token.strip()
         }
+        identity_encoding = upstream_identity_encoding(self.settings.config)
         headers: list[tuple[str, str]] = []
         for name, value in self.headers.items():
             key = name.lower()
@@ -1578,9 +1621,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 continue
             if key in connection_tokens:
                 continue
+            if identity_encoding and key == ACCEPT_ENCODING.lower():
+                # Replaced below by a single header the router chose. Whatever
+                # the client asked for, every copy of it, goes.
+                continue
             headers.append((name, value))
 
         headers.append(("Host", self.target.authority))
+        if identity_encoding:
+            headers.append((ACCEPT_ENCODING, IDENTITY_ENCODING))
         if body:
             headers.append(("Content-Length", str(len(body))))
         elif self.command in _METHODS_EXPECTING_BODY:

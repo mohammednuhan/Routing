@@ -143,6 +143,34 @@ policy:
   # circuit or mode `off`.
   hold_max_requests: 50
 
+  # Fallback to the next model in the same cost tier when the upstream answers
+  # with a retryable status. OFF by default, and only ever acted on in `active`
+  # mode: in shadow and off, and while the kill switch or an open circuit is
+  # forcing a request through, nothing is ever retried.
+  #
+  # A retry forwards the SAME request bytes with only the top-level `model`
+  # value replaced, so every attempt is the request the client sent, on the next
+  # configured model that shares the model just tried's `cost_tier`. Config
+  # order is the order, wrapping around, skipping every model already tried. A
+  # status outside the list below is the upstream's own answer and reaches the
+  # client exactly as it arrived.
+  #
+  # The decision is taken before a single byte is relayed, so a response that
+  # has started streaming to the client is never retried. A retry that succeeds
+  # is relayed; if every attempt fails, the LAST response is relayed unchanged.
+  # The row records the model that produced the relayed response, with reason
+  # FALLBACK_NEXT_IN_TIER.
+  fallback_enabled: false
+  # Statuses that count as retryable. Only these.
+  fallback_statuses:
+    - 429
+    - 502
+    - 503
+    - 504
+  # Retries after the first attempt, at most. 1 means a request is tried at most
+  # twice: once as planned, and once on the next model in the tier.
+  fallback_max_attempts: 1
+
 # Rule-based task classification from the latest human prompt.
 #
 # DISABLED by default, and it must stay that way on a fresh install: while

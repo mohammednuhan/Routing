@@ -75,6 +75,14 @@ PROG = "tamias-router"
 #: on one: it would rewrite requests toward a model nobody verified (Rule 7).
 PLACEHOLDER_PREFIX = "TODO_"
 
+#: The other placeholder marker: an id nobody filled in, left as a marker rather
+#: than removed. Active mode refuses these exactly as it refuses `TODO_` ones.
+FILL_FROM_PREFIX = "FILL_FROM_"
+
+#: Every prefix that marks a model id as a placeholder. A model id is legal in
+#: active mode only when it starts with none of them.
+PLACEHOLDER_PREFIXES: tuple[str, ...] = (PLACEHOLDER_PREFIX, FILL_FROM_PREFIX)
+
 #: Printed once at startup when active mode is allowed to run.
 ACTIVE_BANNER = "ACTIVE MODE: requests may be rewritten to other models"
 
@@ -111,7 +119,11 @@ def build_parser() -> argparse.ArgumentParser:
     start.add_argument(
         "--upstream",
         default=None,
-        help="override the upstream URL from the config (for testing against a mock)",
+        help=(
+            "override the upstream URL from the config (for testing against a mock). "
+            "http or https, optionally with a path prefix; no credentials, query or "
+            "fragment; plain http only to 127.0.0.1 or localhost"
+        ),
     )
     log = sub.add_parser("log", help="print the latest decision-log rows (metadata only)")
     log.add_argument("--last", type=int, default=10, help="how many rows to show (default 10)")
@@ -687,19 +699,29 @@ def active_start_blocker(config: RouterConfig) -> str | None:
 
     Active mode is the only mode that can change a request, so it is the only
     mode that is refused when the config still carries placeholder model ids.
+    Every placeholder marker is refused, `TODO_` and `FILL_FROM_` alike: either
+    one names an id nobody verified, which is the whole thing Rule 7 is about.
     Shadow and off forward every request untouched, so a placeholder there is
     harmless and must stay loadable.
     """
     if config.mode != "active":
         return None
     placeholders = [
-        spec.id for spec in config.models if spec.id.startswith(PLACEHOLDER_PREFIX)
+        spec.id
+        for spec in config.models
+        if spec.id.startswith(PLACEHOLDER_PREFIXES)
     ]
     if not placeholders:
         return None
+    prefixes = [
+        prefix
+        for prefix in PLACEHOLDER_PREFIXES
+        if any(model_id.startswith(prefix) for model_id in placeholders)
+    ]
     return (
         f"refusing to start in active mode: {len(placeholders)} model id(s) are "
-        f"placeholders beginning {PLACEHOLDER_PREFIX!r}: {', '.join(placeholders)}. "
+        f"placeholders beginning {', '.join(repr(prefix) for prefix in prefixes)}: "
+        f"{', '.join(placeholders)}. "
         "Replace each with a verified id plus source and access date, or run in shadow."
     )
 

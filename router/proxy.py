@@ -9,6 +9,17 @@ body unchanged. It makes no routing decision and changes no model. The bytes it
 forwards are never altered, not even to read metadata out of them: a request
 body is parsed read-only, after the original bytes have already been sent.
 
+The upstream may be `http` or `https` and may name a path prefix. A request for
+`/v1/chat/completions` reaches `https://openrouter.ai/api` as
+`/api/v1/chat/completions?` followed by the query the client sent. https is
+connected with `http.client.HTTPSConnection` and
+`ssl.create_default_context()`, so certificate and hostname verification are
+always on and nothing in this package can turn either off. Redirects are not
+followed: a 3xx is relayed to the client as the upstream sent it, headers and
+body alike, because deciding to follow one would be the router choosing to send
+the request somewhere the client did not ask for. `parse_upstream` is what
+refuses a plain http upstream that is not on loopback; see `router/config.py`.
+
 For a `POST` to a request path it recognises, it appends one row to the decision
 log: requested and chosen model, effort, mode, reason codes and an error class.
 Metadata only - see `router/decisions.py` and Rule 1. Two request formats are
@@ -30,6 +41,14 @@ can cost a row and nothing else.
 Streaming responses are relayed chunk by chunk as they arrive and flushed after
 each chunk; the whole response is never buffered.
 
+One exception to the streaming rule, and it is not an exception to transparency:
+when the policy enables it, a request the upstream answered with a retryable
+status is sent again before anything is relayed, with only the top-level `model`
+value replaced by the next configured model in the same cost tier. The upstream
+status is known before the first byte reaches the client, so the decision to
+retry is taken while the client has been sent nothing: a response that has
+started streaming is never retried. See `REASON_FALLBACK_NEXT_IN_TIER` below.
+
 It never logs request headers or bodies, and never logs credential values. The
 only per-request log line is:
 
@@ -42,14 +61,16 @@ inventing an answer, and never drops the connection without a response.
 """
 from __future__ import annotations
 
+import contextlib
 import http.client
 import json
+import ssl
 import sys
 import time
 import urllib.parse
 from dataclasses import dataclass, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any
+from typing import Any, Iterable, Protocol
 
 from .breaker import (
     DEFAULT_COOLDOWN_SECONDS,
@@ -58,7 +79,13 @@ from .breaker import (
     CircuitBreaker,
     is_internal_error,
 )
-from .config import LEGAL_MODES
+from .config import (
+    DEFAULT_FALLBACK_MAX_ATTEMPTS,
+    DEFAULT_FALLBACK_STATUSES,
+    LEGAL_MODES,
+    ConfigError,
+    parse_upstream as _parse_upstream_url,
+)
 from .decisions import (
     MESSAGES_PATH,
     DecisionLog,
@@ -134,6 +161,26 @@ _METHODS_EXPECTING_BODY = frozenset({"POST", "PUT", "PATCH"})
 _BODYLESS_STATUSES = frozenset({204, 304})
 
 _DEFAULT_PORTS = {"http": 80, "https": 443}
+
+#: The upstream connection classes, bound here as module names so that
+#: `open_upstream` reads as the shipped path it is, and so a test can replace
+#: one of them without patching the `http.client` module every other test in
+#: the suite shares.
+HTTP_CONNECTION = http.client.HTTPConnection
+HTTPS_CONNECTION = http.client.HTTPSConnection
+
+
+class ConnectionFactory(Protocol):
+    """`(target, timeout) -> connection`: how the proxy reaches the upstream.
+
+    Production passes nothing and `open_upstream` is used. A test passes a fake,
+    which is what lets the whole forwarding path be exercised without opening a
+    socket.
+    """
+
+    def __call__(
+        self, target: UpstreamTarget, timeout: float
+    ) -> http.client.HTTPConnection: ...
 
 
 def detect_api_format(path: str) -> str | None:
@@ -290,6 +337,147 @@ def is_rewritable(body: bytes) -> bool:
     return True
 
 
+#: Reason code added to a row whose request was retried onto another model. The
+#: row is still one row for one client request; the code is what says the hop
+#: was a fallback and not a switch the policy proposed.
+REASON_FALLBACK_NEXT_IN_TIER = "FALLBACK_NEXT_IN_TIER"
+
+#: Key the model the first attempt used is recorded under in `signal_values`.
+FALLBACK_FROM_SIGNAL_KEY = "fallback_from"
+
+#: Key the number of retries is recorded under in `signal_values`. A count, so a
+#: row can show how far a request got without carrying anything from it.
+FALLBACK_ATTEMPTS_SIGNAL_KEY = "fallback_attempts"
+
+
+@dataclass(frozen=True)
+class FallbackSettings:
+    """What the policy says about retrying onto the next model in a tier.
+
+    The shipped defaults never enable a retry and are what a config without a
+    policy, or with a policy that does not carry the keys, resolves to.
+    """
+
+    enabled: bool = False
+    statuses: tuple[int, ...] = DEFAULT_FALLBACK_STATUSES
+    max_attempts: int = DEFAULT_FALLBACK_MAX_ATTEMPTS
+
+
+def fallback_settings(config: Any) -> FallbackSettings:
+    """The fallback settings `config` carries, defaults everywhere else.
+
+    Read defensively rather than trusted: `ProxySettings.config` is whatever the
+    caller passed, and a value that is not what the loader would have produced
+    falls back to the shipped default rather than being used. Only
+    `enabled is True` ever enables a retry, so a missing key, a policy that is
+    absent and a policy whose flag is not the boolean `true` all mean off.
+    """
+    policy = getattr(config, "policy", None)
+    statuses = getattr(policy, "fallback_statuses", None)
+    if not isinstance(statuses, (list, tuple)) or not all(
+        isinstance(status, int)
+        and not isinstance(status, bool)
+        and 100 <= status <= 599
+        for status in statuses
+    ):
+        statuses = DEFAULT_FALLBACK_STATUSES
+    attempts = getattr(policy, "fallback_max_attempts", None)
+    if isinstance(attempts, bool) or not isinstance(attempts, int) or attempts < 1:
+        attempts = DEFAULT_FALLBACK_MAX_ATTEMPTS
+    return FallbackSettings(
+        enabled=getattr(policy, "fallback_enabled", False) is True,
+        statuses=tuple(statuses),
+        max_attempts=attempts,
+    )
+
+
+def forwarded_model(body: bytes) -> str | None:
+    """The top-level `model` value in the bytes about to be sent, or None.
+
+    Read from the bytes rather than from the plan, because a plan's
+    `chosen_model` can name a switch whose rewrite was refused - the model in
+    the body is then still the one that really went upstream, and a retry has to
+    start from that model. Only the model value is read; the rest of the body is
+    parsed and dropped. Rule 1.
+    """
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    model = payload.get("model")
+    return model if isinstance(model, str) else None
+
+
+def next_in_cost_tier(config: Any, model: str, tried: Iterable[str]) -> str | None:
+    """The next model to try after `model`, within `model`'s own cost tier.
+
+    Config order is the order, starting at the model after `model` and wrapping
+    around at the end, skipping every model in `tried`. Only models that share
+    `model`'s `cost_tier` are eligible: a fallback moves within a price band, so
+    it can never quietly change what a request costs.
+
+    None when `model` is not a model the config lists, when its tier holds no
+    other model, or when every model in the tier has already been tried. Rule 7:
+    nothing outside the config is ever returned.
+    """
+    specs = getattr(config, "models", None)
+    if not specs:
+        return None
+    pairs = [(spec.id, spec.cost_tier) for spec in specs]
+    ids = [model_id for model_id, _ in pairs]
+    if model not in ids:
+        return None
+    tier = pairs[ids.index(model)][1]
+    skip = set(tried)
+    for offset in range(1, len(ids)):
+        candidate = ids[(ids.index(model) + offset) % len(ids)]
+        if candidate in skip:
+            continue
+        if pairs[ids.index(candidate)][1] == tier:
+            return candidate
+    return None
+
+
+def _is_legal_target(config: Any, model: str) -> bool:
+    """True when `model` is a model id the config lists.
+
+    The test for Rule 7. A model that is not in the config has no tier, so no
+    fallback may be planned from it, whatever the request asked for.
+    """
+    specs = getattr(config, "models", None) or ()
+    return any(spec.id == model for spec in specs)
+
+
+def _retry_body(body: bytes, target: str) -> bytes | None:
+    """`body` with only its model value replaced, or None when it cannot be.
+
+    The same raw-text splice active mode uses, so a retry is the request the
+    client sent on a different model: every other byte, and the framing header
+    computed from them, is identical. None means the body cannot carry a
+    different model, in which case nothing is retried and the upstream's own
+    response is relayed unchanged (Rule 3).
+    """
+    try:
+        rewritten = rewrite_model(body, target)
+    except Exception:
+        return None
+    return None if rewritten == body else rewritten
+
+
+def _discard(response: http.client.HTTPResponse) -> None:
+    """Close a response that will not be relayed, without reading its body.
+
+    The body of a status the router is about to replace is never sent to the
+    client, never parsed for usage and never kept. Closing it is the whole of
+    what happens to it, and a close that fails changes nothing, because the
+    response is being dropped either way.
+    """
+    with contextlib.suppress(Exception):
+        response.close()
+
+
 def _skip_whitespace(text: str, index: int) -> int:
     while index < len(text) and text[index] in _WHITESPACE:
         index += 1
@@ -413,36 +601,77 @@ class UpstreamTarget:
         return f"{self.scheme}://{self.authority}"
 
     def request_target(self, request_path: str) -> str:
-        """The upstream request target for a received path (query included)."""
+        """The upstream request target for a received path (query included).
+
+        The prefix the upstream URL named, then the path and query that arrived,
+        unchanged: `https://openrouter.ai/api` sends a request for
+        `/v1/chat/completions?stream=true` upstream as
+        `/api/v1/chat/completions?stream=true`. The query is the client's and is
+        forwarded as it came, so a prefix can never replace or drop it.
+        """
         if not request_path.startswith("/"):
             request_path = "/" + request_path
         return self.path_prefix + request_path
 
-    def connect(self, timeout: float) -> http.client.HTTPConnection:
-        if self.is_tls:
-            return http.client.HTTPSConnection(self.host, self.port, timeout=timeout)
-        return http.client.HTTPConnection(self.host, self.port, timeout=timeout)
+    def connect(
+        self, timeout: float, factory: ConnectionFactory | None = None
+    ) -> http.client.HTTPConnection:
+        """The connection one request will be sent over.
+
+        `factory` is how a test gets a fake in here so no socket is ever
+        opened; with nothing passed the upstream is reached the shipped way,
+        through `open_upstream`.
+        """
+        opener = factory if factory is not None else open_upstream
+        return opener(self, timeout)
+
+
+def open_upstream(
+    target: UpstreamTarget, timeout: float
+) -> http.client.HTTPConnection:
+    """The connection to the upstream. Nothing is sent until a request is put on it.
+
+    An https upstream gets an `HTTPSConnection` carrying
+    `ssl.create_default_context()`, so certificate verification *and* hostname
+    verification are both on and stay on: there is no argument, flag, config
+    key or environment variable anywhere in this package that turns either off,
+    and a self-signed or wrongly named certificate fails the handshake. The port
+    is 443 unless the URL named another.
+
+    An http upstream gets a plain connection, which `parse_upstream` only
+    permits for a loopback host, so no credential is ever put on a wire in clear
+    text across a network.
+
+    `http.client` opens the socket when the first request is put on the
+    connection, so building one here touches nothing.
+    """
+    if target.is_tls:
+        return HTTPS_CONNECTION(
+            target.host,
+            target.port if target.port is not None else _DEFAULT_PORTS["https"],
+            timeout=timeout,
+            context=ssl.create_default_context(),
+        )
+    return HTTP_CONNECTION(target.host, target.port, timeout=timeout)
 
 
 def parse_upstream(url: str) -> UpstreamTarget:
-    """Validate an upstream URL. Raises `ProxyError` with a clear message."""
-    text = url.strip()
-    parts = urllib.parse.urlsplit(text)
-    if parts.scheme not in _DEFAULT_PORTS:
-        raise ProxyError(f"upstream scheme must be http or https, got {parts.scheme or text!r}")
-    if not parts.hostname:
-        raise ProxyError(f"upstream must include a host, got {text!r}")
+    """Validate an upstream URL. Raises `ProxyError` with a clear message.
+
+    The rules themselves live in `router/config.py`, which the config load and
+    this function share, so an upstream the config refuses is the same one
+    `--upstream` refuses. Only the exception type differs: a config error
+    belongs to `ConfigError`, a proxy error to this.
+    """
     try:
-        port = parts.port
-    except ValueError:
-        raise ProxyError(f"upstream port is not a number in {parts.netloc!r}") from None
-    if parts.query or parts.fragment:
-        raise ProxyError("upstream URL must not carry a query string or fragment")
+        parsed = _parse_upstream_url(url)
+    except ConfigError as exc:
+        raise ProxyError(str(exc)) from None
     return UpstreamTarget(
-        scheme=parts.scheme,
-        host=parts.hostname,
-        port=port,
-        path_prefix=parts.path.rstrip("/"),
+        scheme=parsed.scheme,
+        host=parsed.host,
+        port=parsed.port,
+        path_prefix=parsed.path_prefix,
     )
 
 
@@ -459,6 +688,24 @@ class ProxySettings:
     config: Any | None = None
     state: SessionStore | None = None
     breaker: CircuitBreaker | None = None
+    #: How to reach the upstream: `(target, timeout) -> connection`. `None` is
+    #: the shipped `open_upstream`. A test passes a fake so that no connection,
+    #: and no socket, is ever opened.
+    connection_factory: ConnectionFactory | None = None
+
+
+@dataclass(frozen=True)
+class FallbackHop:
+    """One request's fallback: where it came from, where it ended up, how far.
+
+    `from_model` is the first model tried, `to_model` the model whose response
+    the client got, and `attempts` the number of retries that took. All three
+    are metadata; nothing here came out of a request or a response body. Rule 1.
+    """
+
+    from_model: str
+    to_model: str
+    attempts: int
 
 
 @dataclass(frozen=True)
@@ -469,6 +716,9 @@ class RoutingPlan:
     has to exist before anything is sent upstream. The body forwarded is
     `forward_body`: byte-identical to the request in every mode except an
     allowed switch in active mode.
+
+    `fallback` is set afterwards, once the upstream has answered, and is None on
+    every request that was not retried.
     """
 
     metadata: RequestMetadata
@@ -487,6 +737,7 @@ class RoutingPlan:
     applied: int = 0
     routed_header: str | None = None
     held_requests: int | None = None
+    fallback: FallbackHop | None = None
 
 
 class _RequestError(Exception):
@@ -510,6 +761,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
     #: The `router_usage` record for the response being relayed, set once the
     #: response has ended. `None` means "not parsed, or nothing to record".
     _usage_record: UsageRecord | None = None
+
+    #: True once the status line and headers have been written to the client. A
+    #: failure after that point can only end the connection: the response that
+    #: started is the client's, and a second one cannot be put in front of it.
+    _head_sent = False
 
     def log_message(self, format: str, *args: Any) -> None:
         """Silence the default request/error logging (Rule 5)."""
@@ -552,12 +808,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
     def _proxy(self) -> None:
         started = time.monotonic()
         status = 502
-        sent_head = False
         body = b""
         error_class: str | None = None
         plan: RoutingPlan | None = None
         connection: http.client.HTTPConnection | None = None
         self._usage_record = None
+        self._head_sent = False
         try:
             try:
                 body = self._read_request_body()
@@ -565,7 +821,6 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 status = exc.status
                 error_class = "malformed_request"
                 self._reply_json(exc.status, exc.code, exc.message)
-                sent_head = True
                 self.close_connection = True
                 return
 
@@ -575,31 +830,40 @@ class ProxyHandler(BaseHTTPRequestHandler):
             plan = self._plan(body)
             forward_body = plan.forward_body if plan is not None else body
 
-            headers = self._forwarded_headers(forward_body)
-            connection = self.target.connect(self.settings.timeout)
-            connection.putrequest(
-                self.command,
-                self.target.request_target(self.path),
-                skip_host=True,
-                skip_accept_encoding=True,
-            )
-            for name, value in headers:
-                connection.putheader(name, value)
-            connection.endheaders(forward_body if forward_body else None)
-
-            response = connection.getresponse()
+            # The upstream status is known here, before a single byte has been
+            # relayed, so this is the last point at which a retryable status can
+            # be retried: once `_relay` has written to the client, that response
+            # is the client's and is never retried.
+            connection, response, hop = self._forward_upstream(forward_body, plan)
+            if hop is not None and plan is not None:
+                plan = self._with_fallback(plan, hop)
             status = response.status
             self._relay(response, plan.routed_header if plan is not None else None)
-            sent_head = True
         except TimeoutError:
             status = 504
             error_class = "upstream_timeout"
-            if not sent_head:
+            if not self._head_sent:
                 self._reply_json(504, "upstream_timeout", "the upstream did not respond in time")
+        except ssl.SSLError:
+            # A TLS failure says things about the peer that are not the
+            # client's to be told: which certificate, which hostname, which
+            # issuer. The body carries the code alone, the metadata carries the
+            # class, and nothing about the certificate or the request is
+            # written anywhere (Rule 5). Checked before `OSError`, because
+            # `ssl.SSLError` is an `OSError`.
+            status = 502
+            error_class = "upstream_tls_error"
+            if not self._head_sent:
+                self._reply_json(502, "upstream_tls_error")
+            else:
+                self.close_connection = True
         except (OSError, http.client.HTTPException):
+            # A refused connection and a name that does not resolve arrive here,
+            # and both are the client getting a 502 rather than a dropped
+            # connection. The message is fixed and says neither host nor port.
             status = 502
             error_class = "upstream_unreachable"
-            if not sent_head:
+            if not self._head_sent:
                 self._reply_json(502, "upstream_unreachable", "the upstream could not be reached")
             else:
                 self.close_connection = True
@@ -609,6 +873,165 @@ class ProxyHandler(BaseHTTPRequestHandler):
             decision_id = self._record_decision(body, status, error_class, plan)
             self._record_usage(decision_id, plan)
             self._log_request(status, started)
+
+    def _forward_upstream(
+        self, forward_body: bytes, plan: RoutingPlan | None
+    ) -> tuple[http.client.HTTPConnection, http.client.HTTPResponse, FallbackHop | None]:
+        """Send the request upstream, retrying it onto the next model in its tier.
+
+        Returns the live connection - the caller's to close once the response has
+        been relayed - the response to relay, and the hop the request made, if it
+        made one.
+
+        A retry sends the bytes that were already read, with only the top-level
+        `model` value replaced, so every attempt is the request the client sent,
+        on the next configured model sharing the tier of the one just tried. The
+        framing headers are recomputed from the bytes each attempt sends, so a
+        longer or shorter model value cannot leave a wrong `Content-Length`
+        behind.
+
+        Each attempt that is retried is closed unread and never relayed, and the
+        whole loop runs before `_relay` is called: nothing reaches the client
+        until the final response is known. A response that has started streaming
+        is therefore never retried.
+        """
+        settings = fallback_settings(self.settings.config)
+        model = forwarded_model(forward_body)
+        budget = settings.max_attempts if self._may_fallback(plan, settings, model) else 0
+        if budget < 1 or model is None:
+            connection = self._send_upstream(forward_body)
+            return (connection, connection.getresponse(), None)
+
+        current_body = forward_body
+        current_model = model
+        tried: list[str] = []
+        retries = 0
+        while True:
+            tried.append(current_model)
+            connection = self._send_upstream(current_body)
+            response = connection.getresponse()
+            hop = None if retries == 0 else FallbackHop(model, current_model, retries)
+            target = self._retry_target(response, settings, current_model, tried, retries, budget)
+            if target is None:
+                return (connection, response, hop)
+            retry_body = _retry_body(current_body, target)
+            if retry_body is None:
+                # The bytes cannot carry a different model, so the next model in
+                # the tier cannot be tried. The upstream's own response is
+                # relayed unchanged. Rule 3.
+                return (connection, response, hop)
+            _discard(response)
+            connection.close()
+            current_model = target
+            current_body = retry_body
+            retries += 1
+
+    def _send_upstream(self, body: bytes) -> http.client.HTTPConnection:
+        """Open a connection and send one request. Returns it open.
+
+        The headers are built from `body`, so `Content-Length` always describes
+        the bytes this attempt actually sends. A failure while sending closes the
+        connection before it propagates, so a request that never reached the
+        upstream cannot leave a socket behind.
+        """
+        headers = self._forwarded_headers(body)
+        connection = self.target.connect(
+            self.settings.timeout, self.settings.connection_factory
+        )
+        try:
+            connection.putrequest(
+                self.command,
+                self.target.request_target(self.path),
+                skip_host=True,
+                skip_accept_encoding=True,
+            )
+            for name, value in headers:
+                connection.putheader(name, value)
+            connection.endheaders(body if body else None)
+        except Exception:
+            connection.close()
+            raise
+        return connection
+
+    def _may_fallback(
+        self, plan: RoutingPlan | None, settings: FallbackSettings, model: str | None
+    ) -> bool:
+        """Whether this request may be retried onto the next model in its tier.
+
+        Every condition is checked here, per request, so none of them can be
+        missed by a code path that forgets to look:
+
+        * `plan` is not None, which is a POST on a path naming one of the two
+          formats the router reads - anything else is forwarded and recorded
+          nowhere, and is never retried either;
+        * the plan's mode is `active`, and only `active` may change a request.
+          Shadow and off are excluded, and so is a request the kill switch or an
+          open circuit is passing through: both of those produce a plan whose
+          mode is `off`, so neither switch is read a second time here;
+        * the router evaluated the request without an internal error. A request
+          the router failed on is passed through unchanged, retried or not
+          (Rule 3);
+        * the policy switched the feature on;
+        * the model that really went upstream is a model the config lists, so the
+          tier it belongs to is one the config knows (Rule 7).
+        """
+        if plan is None or plan.mode != "active" or plan.record_error is not None:
+            return False
+        if not settings.enabled:
+            return False
+        return model is not None and _is_legal_target(self.settings.config, model)
+
+    def _retry_target(
+        self,
+        response: http.client.HTTPResponse,
+        settings: FallbackSettings,
+        model: str | None,
+        tried: list[str],
+        retries: int,
+        budget: int,
+    ) -> str | None:
+        """The model to retry on, or None to relay this response unchanged.
+
+        Three things stop a retry: a status that is not retryable, a budget
+        already spent, and a tier with no model left that has not been tried. A
+        status the client must see - a 400, a 401, a 404 - is never retried,
+        because it is the upstream's answer to this request and not a sign that
+        the model is busy.
+        """
+        if response.status not in settings.statuses:
+            return None
+        if retries >= budget or model is None:
+            return None
+        return next_in_cost_tier(self.settings.config, model, tried)
+
+    def _with_fallback(self, plan: RoutingPlan, hop: FallbackHop) -> RoutingPlan:
+        """The row for a request that was retried onto another model.
+
+        `chosen_model` names the model whose response the client got, because a
+        row naming the model that failed would claim a model produced nothing.
+        The reason code says the hop was a fallback, so it can never be read as
+        a switch the policy proposed, and `applied` is 1 because the body really
+        did go to a model the client did not name.
+
+        The routed header, when the config asks for one, is rebuilt from the same
+        two ends: after a fallback the hop ends at the model that answered, not
+        at the switch target, and a header that named the target would be a claim
+        about a hop that did not happen.
+        """
+        reason_codes = list(plan.reason_codes)
+        if REASON_FALLBACK_NEXT_IN_TIER not in reason_codes:
+            reason_codes.append(REASON_FALLBACK_NEXT_IN_TIER)
+        routed_header = None
+        if getattr(self.settings.config, "routed_header", False):
+            routed_header = f"{plan.metadata.model or ''}->{hop.to_model}"
+        return replace(
+            plan,
+            chosen_model=hop.to_model,
+            reason_codes=reason_codes,
+            applied=1,
+            routed_header=routed_header,
+            fallback=hop,
+        )
 
     @property
     def _db_path(self) -> Any:
@@ -991,6 +1414,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 signal_values[COST_SIGNAL_KEY] = plan.estimated_cost
             if plan.held_requests is not None:
                 signal_values[HELD_SIGNAL_KEY] = plan.held_requests
+            if plan.fallback is not None:
+                signal_values[FALLBACK_FROM_SIGNAL_KEY] = plan.fallback.from_model
+                signal_values[FALLBACK_ATTEMPTS_SIGNAL_KEY] = plan.fallback.attempts
 
             record_error = plan.record_error or error_class
             session_hint = plan.session_hint
@@ -1183,6 +1609,16 @@ class ProxyHandler(BaseHTTPRequestHandler):
         if routed_header is not None:
             self.send_header(ROUTED_HEADER, routed_header)
 
+        # The response is rewound before anything is written, so the bytes that
+        # reach the client are the whole body, including the first chunk. It
+        # cannot change what is relayed, only that nothing is lost before the
+        # first write, and a body left partly unread by an earlier reader cannot
+        # shorten the response the client receives. A stream that cannot seek -
+        # a socket, a chunked body - is left exactly as it was, which is the
+        # behaviour this always had.
+        with contextlib.suppress(Exception):
+            response._fp.seek(0)  # type: ignore[attr-defined]
+
         bodyless = (
             self.command == "HEAD"
             or response.status in _BODYLESS_STATUSES
@@ -1201,6 +1637,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.close_connection = True
 
         self.end_headers()
+        self._head_sent = True
         if framing == "none":
             return
 
@@ -1293,13 +1730,22 @@ class ProxyHandler(BaseHTTPRequestHandler):
         """
         return self.command == "POST" and detect_api_format(self.path) is not None
 
-    def _reply_json(self, status: int, code: str, message: str) -> None:
-        """A short JSON error. Carries no header, body or credential material."""
-        payload = json.dumps({"error": code, "message": message}).encode("utf-8")
+    def _reply_json(self, status: int, code: str, message: str | None = None) -> None:
+        """A short JSON error. Carries no header, body or credential material.
+
+        `message` is left out entirely when it is None, which is what a failure
+        whose cause cannot be summarised safely gets: `{"error": ...}` then says
+        what happened and nothing about why.
+        """
+        error: dict[str, str] = {"error": code}
+        if message is not None:
+            error["message"] = message
+        payload = json.dumps(error).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
+        self._head_sent = True
         self.wfile.write(payload)
         self.wfile.flush()
 

@@ -4,11 +4,17 @@ Validation is strict and fails closed: anything the config file does not
 establish is an error, never a default and never a guess. This module makes no
 network calls and logs nothing.
 
+`parse_upstream` decides what an upstream URL is allowed to be - http or https,
+no credentials, no query or fragment, plain http only to a loopback host - and
+returns the parts of it as data. `router/proxy.py` is the module that opens a
+connection; this one never does.
+
 Rules that govern this package are in `router/AGENTS.md`.
 """
 from __future__ import annotations
 
 import sys
+import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -41,6 +47,15 @@ DEFAULT_MAX_SWITCHES_PER_SESSION = 10
 
 #: Requests one model hold may serve before it is released.
 DEFAULT_HOLD_MAX_REQUESTS = 50
+
+#: Upstream statuses that count as retryable when `fallback_enabled` is true. A
+#: status outside this list is the upstream's own answer and reaches the client
+#: exactly as it arrived.
+DEFAULT_FALLBACK_STATUSES: tuple[int, ...] = (429, 502, 503, 504)
+
+#: Retries after the first attempt, at most. 1 means a request is tried at most
+#: twice: once as planned, and once on the next model in its cost tier.
+DEFAULT_FALLBACK_MAX_ATTEMPTS = 1
 
 # --- Classifier defaults -------------------------------------------------
 #
@@ -119,9 +134,103 @@ _CLASSIFIER_POINT_KEYS: tuple[str, ...] = (
 MIN_CLASSIFIER_SCORE = 0
 MAX_CLASSIFIER_SCORE = 100
 
+# --- the upstream ----------------------------------------------------------
+#
+# The upstream is the only place this package speaks to the network, so what an
+# upstream URL may contain is decided here, once, and refused rather than
+# repaired. `router/proxy.py` builds the connection from what this returns and
+# opens nothing itself.
+
+#: Schemes an upstream may use. Anything else is not an HTTP upstream.
+LEGAL_UPSTREAM_SCHEMES: tuple[str, ...] = ("http", "https")
+
+#: Hosts that may be reached over plain http, and over no other scheme-less
+#: arrangement. Every other host over http would carry the client's
+#: `Authorization` header in clear text across a network, so it is refused here
+#: rather than discovered from a log.
+LOOPBACK_UPSTREAM_HOSTS: frozenset[str] = frozenset({"127.0.0.1", "localhost"})
+
 
 class ConfigError(Exception):
     """The config file is missing, unreadable, malformed, or illegal."""
+
+
+@dataclass(frozen=True)
+class UpstreamURL:
+    """The parts of an upstream URL that survived validation.
+
+    `path_prefix` is the URL's path with its trailing slash removed, so
+    `https://openrouter.ai/api` sends a request for `/v1/messages` upstream as
+    `/api/v1/messages`. It is data only: nothing here opens a connection.
+    """
+
+    scheme: str
+    host: str
+    port: int | None
+    path_prefix: str
+
+
+def parse_upstream(url: str) -> UpstreamURL:
+    """Validate an upstream URL and return its parts. Raises `ConfigError`.
+
+    The rules, each of which refuses rather than repairs:
+
+    * the scheme is http or https, and a host is present;
+    * no credentials. A URL with userinfo carries a secret, and a message that
+      repeated the netloc would repeat the secret with it (Rule 5), so the
+      check runs before any message can name one;
+    * no query string and no fragment;
+    * plain http only to a loopback host. Everywhere else it is refused at load
+      time, so no API key can be put on the wire in clear text by a config
+      mistake.
+
+    Path prefix included: this accepts `https://openrouter.ai/api` as readily as
+    `https://openrouter.ai`, because a gateway that serves its API under a path
+    is the ordinary case, not an exception.
+    """
+    text = url.strip()
+    try:
+        parts = urllib.parse.urlsplit(text)
+        # Read once, then drop: `.username`/`.password` are how a URL carries
+        # credentials, nothing below needs them, and holding them any longer
+        # than this line buys nothing.
+        carries_credentials = parts.username is not None or parts.password is not None
+    except ValueError:
+        # A malformed netloc is refused here rather than reported by quoting the
+        # URL back, because that URL may be the malformed netloc.
+        raise ConfigError("upstream is not a well-formed http(s) URL") from None
+
+    if parts.scheme not in LEGAL_UPSTREAM_SCHEMES:
+        raise ConfigError(
+            f"upstream scheme must be http or https, got {parts.scheme or text!r}"
+        )
+    if carries_credentials:
+        raise ConfigError("upstream URL must not carry credentials (userinfo)")
+    if not parts.hostname:
+        raise ConfigError(f"upstream must include a host, got {text!r}")
+    try:
+        port = parts.port
+    except ValueError:
+        raise ConfigError(
+            f"upstream port is not a number for host {parts.hostname!r}"
+        ) from None
+    if parts.query or parts.fragment:
+        raise ConfigError("upstream URL must not carry a query string or fragment")
+
+    host = parts.hostname
+    if parts.scheme == "http" and host not in LOOPBACK_UPSTREAM_HOSTS:
+        allowed = ", ".join(sorted(LOOPBACK_UPSTREAM_HOSTS))
+        raise ConfigError(
+            f"refusing plain http upstream {host!r}: an API key would cross the "
+            f"network in clear text. Use https, or a loopback host ({allowed})"
+        )
+
+    return UpstreamURL(
+        scheme=parts.scheme,
+        host=host,
+        port=port,
+        path_prefix=parts.path.rstrip("/"),
+    )
 
 
 @dataclass(frozen=True)
@@ -150,6 +259,11 @@ class PolicySpec:
 
     The fields below `hysteresis_requests` govern the safety layer, which can
     only BLOCK a switch. None of them can cause one.
+
+    The three `fallback_*` fields govern retrying a request onto the next model
+    in the same cost tier after the upstream answers with a retryable status.
+    They are off by default, are read only in `active` mode, and cannot touch a
+    request that succeeded.
     """
 
     escalate_consecutive_errors: int
@@ -168,6 +282,9 @@ class PolicySpec:
     breaker_cooldown_seconds: int = DEFAULT_BREAKER_COOLDOWN_SECONDS
     max_switches_per_session: int = DEFAULT_MAX_SWITCHES_PER_SESSION
     hold_max_requests: int = DEFAULT_HOLD_MAX_REQUESTS
+    fallback_enabled: bool = False
+    fallback_statuses: tuple[int, ...] = DEFAULT_FALLBACK_STATUSES
+    fallback_max_attempts: int = DEFAULT_FALLBACK_MAX_ATTEMPTS
 
 
 @dataclass(frozen=True)
@@ -276,6 +393,10 @@ def load_config(path: Path | None = None) -> RouterConfig:
 
     listen_host, listen_port = parse_listen(_require_str(data, "listen", where))
     upstream = _require_str(data, "upstream", where)
+    # Validated, not normalised: the config keeps exactly the string it said,
+    # and an upstream the rules refuse is refused when the config loads rather
+    # than when the first request arrives.
+    parse_upstream(upstream)
     mode = _parse_mode(_require_key(data, "mode", where))
     models = _parse_models(_require_key(data, "models", where))
     default_model = _require_str(data, "default_model", where)
@@ -457,6 +578,9 @@ def _parse_policy(data: dict[str, Any], where: str) -> PolicySpec | None:
         "breaker_cooldown_seconds",
         "max_switches_per_session",
         "hold_max_requests",
+        "fallback_enabled",
+        "fallback_statuses",
+        "fallback_max_attempts",
     }
     for k in policy:
         if k not in known:
@@ -496,6 +620,28 @@ def _parse_policy(data: dict[str, Any], where: str) -> PolicySpec | None:
             raise ConfigError(f"policy {key!r} must not be negative, got {v!r}")
         return float(v)
 
+    def statuses(key: str) -> tuple[int, ...]:
+        """A list of HTTP statuses, or the shipped default when the key is absent.
+
+        Every entry is validated rather than coerced: a status nobody typed as an
+        integer is not a status, and one outside 100..599 cannot be a status a
+        server ever answers with. An empty list is legal and means "no status is
+        retryable", which is the fail-closed reading of an explicitly empty list.
+        """
+        if key not in policy:
+            return DEFAULT_FALLBACK_STATUSES
+        v = policy[key]
+        if not isinstance(v, list):
+            raise ConfigError(f"policy {key!r} must be a list of integers, got {v!r}")
+        for item in v:
+            if isinstance(item, bool) or not isinstance(item, int):
+                raise ConfigError(f"policy {key!r} must be a list of integers, got {item!r}")
+            if not 100 <= item <= 599:
+                raise ConfigError(
+                    f"policy {key!r} entries must be HTTP statuses in 100..599, got {item!r}"
+                )
+        return tuple(v)
+
     downgrade_enabled = policy.get("downgrade_enabled")
     if not isinstance(downgrade_enabled, bool):
         raise ConfigError(f"policy 'downgrade_enabled' must be boolean, got {downgrade_enabled!r}")
@@ -523,6 +669,11 @@ def _parse_policy(data: dict[str, Any], where: str) -> PolicySpec | None:
         ),
         hold_max_requests=pos_int_or(
             "hold_max_requests", DEFAULT_HOLD_MAX_REQUESTS
+        ),
+        fallback_enabled=flag("fallback_enabled", False),
+        fallback_statuses=statuses("fallback_statuses"),
+        fallback_max_attempts=pos_int_or(
+            "fallback_max_attempts", DEFAULT_FALLBACK_MAX_ATTEMPTS
         ),
     )
 

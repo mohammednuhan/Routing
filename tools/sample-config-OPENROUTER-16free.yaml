@@ -1,0 +1,305 @@
+# FREE OPENROUTER MODELS. Ids come from the live OpenRouter listing; free models
+# rotate without notice, so re-verify before use. The tier assignment is a guess
+# from model names, not a measurement. A price of 0.0 means free (':free' models).
+
+listen: 127.0.0.1:8787
+upstream: https://openrouter.ai/api
+
+# The one mode in which a request body may be changed. Every other mode in this
+# repository forwards every request untouched.
+mode: shadow
+
+routed_header: true
+
+models:
+  # A 0.0 price is a real price, not an unknown. Every model here is a ':free'
+  # model, so zero is what the provider charges and the row is OK at $0.00 rather
+  # than UNPRICED. A null would say nobody knows, which would be false.
+  - id: poolside/laguna-xs-2.1:free
+    legal_efforts:
+      # TODO(owner): not verified per model; the agent sends no effort
+      - low
+      - medium
+      - high
+    cost_tier: low
+    # 0.0: a free ':free' model. Zero is a price, never an unknown.
+    input_per_million: 0.0
+    output_per_million: 0.0
+    cache_write_per_million: 0.0
+    cache_read_per_million: 0.0
+  - id: apodex/apodex-1.1-mini:free
+    legal_efforts:
+      # TODO(owner): not verified per model; the agent sends no effort
+      - low
+      - medium
+      - high
+    cost_tier: low
+    # 0.0: a free ':free' model. Zero is a price, never an unknown.
+    input_per_million: 0.0
+    output_per_million: 0.0
+    cache_write_per_million: 0.0
+    cache_read_per_million: 0.0
+  - id: cohere/north-mini-code:free
+    legal_efforts:
+      # TODO(owner): not verified per model; the agent sends no effort
+      - low
+      - medium
+      - high
+    cost_tier: low
+    # 0.0: a free ':free' model. Zero is a price, never an unknown.
+    input_per_million: 0.0
+    output_per_million: 0.0
+    cache_write_per_million: 0.0
+    cache_read_per_million: 0.0
+  - id: thinkingmachines/inkling-small:free
+    legal_efforts:
+      # TODO(owner): not verified per model; the agent sends no effort
+      - low
+      - medium
+      - high
+    cost_tier: low
+    # 0.0: a free ':free' model. Zero is a price, never an unknown.
+    input_per_million: 0.0
+    output_per_million: 0.0
+    cache_write_per_million: 0.0
+    cache_read_per_million: 0.0
+  - id: nvidia/nemotron-3.5-lightning:free
+    legal_efforts:
+      # TODO(owner): not verified per model; the agent sends no effort
+      - low
+      - medium
+      - high
+    cost_tier: low
+    # 0.0: a free ':free' model. Zero is a price, never an unknown.
+    input_per_million: 0.0
+    output_per_million: 0.0
+    cache_write_per_million: 0.0
+    cache_read_per_million: 0.0
+  - id: liquid/lfm-2.5-2.6b:free
+    legal_efforts:
+      # TODO(owner): not verified per model; the agent sends no effort
+      - low
+      - medium
+      - high
+    cost_tier: low
+    # 0.0: a free ':free' model. Zero is a price, never an unknown.
+    input_per_million: 0.0
+    output_per_million: 0.0
+    cache_write_per_million: 0.0
+    cache_read_per_million: 0.0
+  - id: poolside/laguna-s-2.1:free
+    legal_efforts:
+      # TODO(owner): not verified per model; the agent sends no effort
+      - low
+      - medium
+      - high
+    cost_tier: mid
+    # 0.0: a free ':free' model. Zero is a price, never an unknown.
+    input_per_million: 0.0
+    output_per_million: 0.0
+    cache_write_per_million: 0.0
+    cache_read_per_million: 0.0
+  - id: google/gemma-4-26b-a4b-it:free
+    legal_efforts:
+      # TODO(owner): not verified per model; the agent sends no effort
+      - low
+      - medium
+      - high
+    cost_tier: mid
+    # 0.0: a free ':free' model. Zero is a price, never an unknown.
+    input_per_million: 0.0
+    output_per_million: 0.0
+    cache_write_per_million: 0.0
+    cache_read_per_million: 0.0
+  - id: google/gemma-4-31b-it:free
+    legal_efforts:
+      # TODO(owner): not verified per model; the agent sends no effort
+      - low
+      - medium
+      - high
+    cost_tier: mid
+    # 0.0: a free ':free' model. Zero is a price, never an unknown.
+    input_per_million: 0.0
+    output_per_million: 0.0
+    cache_write_per_million: 0.0
+    cache_read_per_million: 0.0
+  - id: qwen/qwen3.8-27b:free
+    legal_efforts:
+      # TODO(owner): not verified per model; the agent sends no effort
+      - low
+      - medium
+      - high
+    cost_tier: mid
+    # 0.0: a free ':free' model. Zero is a price, never an unknown.
+    input_per_million: 0.0
+    output_per_million: 0.0
+    cache_write_per_million: 0.0
+    cache_read_per_million: 0.0
+  - id: inclusionai/ling-3.0-flash-sante:free
+    legal_efforts:
+      # TODO(owner): not verified per model; the agent sends no effort
+      - low
+      - medium
+      - high
+    cost_tier: mid
+    # 0.0: a free ':free' model. Zero is a price, never an unknown.
+    input_per_million: 0.0
+    output_per_million: 0.0
+    cache_write_per_million: 0.0
+    cache_read_per_million: 0.0
+  - id: nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free
+    legal_efforts:
+      # TODO(owner): not verified per model; the agent sends no effort
+      - low
+      - medium
+      - high
+    cost_tier: mid
+    # 0.0: a free ':free' model. Zero is a price, never an unknown.
+    input_per_million: 0.0
+    output_per_million: 0.0
+    cache_write_per_million: 0.0
+    cache_read_per_million: 0.0
+  - id: dots-studio/dots-3-note-preview:free
+    legal_efforts:
+      # TODO(owner): not verified per model; the agent sends no effort
+      - low
+      - medium
+      - high
+    cost_tier: mid
+    # 0.0: a free ':free' model. Zero is a price, never an unknown.
+    input_per_million: 0.0
+    output_per_million: 0.0
+    cache_write_per_million: 0.0
+    cache_read_per_million: 0.0
+  - id: nvidia/nemotron-3-ultra-550b-a55b:free
+    legal_efforts:
+      # TODO(owner): not verified per model; the agent sends no effort
+      - low
+      - medium
+      - high
+    cost_tier: high
+    # 0.0: a free ':free' model. Zero is a price, never an unknown.
+    input_per_million: 0.0
+    output_per_million: 0.0
+    cache_write_per_million: 0.0
+    cache_read_per_million: 0.0
+  - id: nvidia/nemotron-3-super-120b-a12b:free
+    legal_efforts:
+      # TODO(owner): not verified per model; the agent sends no effort
+      - low
+      - medium
+      - high
+    cost_tier: high
+    # 0.0: a free ':free' model. Zero is a price, never an unknown.
+    input_per_million: 0.0
+    output_per_million: 0.0
+    cache_write_per_million: 0.0
+    cache_read_per_million: 0.0
+  - id: thinkingmachines/inkling:free
+    legal_efforts:
+      # TODO(owner): not verified per model; the agent sends no effort
+      - low
+      - medium
+      - high
+    cost_tier: high
+    # 0.0: a free ':free' model. Zero is a price, never an unknown.
+    input_per_million: 0.0
+    output_per_million: 0.0
+    cache_write_per_million: 0.0
+    cache_read_per_million: 0.0
+
+default_model: poolside/laguna-s-2.1:free
+default_effort: medium
+
+# Identical to the shipped policy block. Only the prices and the two benefit
+# figures differ, and those differ from the shipped file by being non-null.
+policy:
+  # Escalate when this many tool results in a row were errors.
+  escalate_consecutive_errors: 2
+  # Escalate when one tool is called this many times in a row.
+  escalate_repeated_tool_calls: 3
+  # Downgrade on small, clean contexts.
+  downgrade_enabled: true
+  downgrade_max_context_tokens: 2000
+  downgrade_max_turn_index: 1
+  # Safety layer. These can only BLOCK a switch; none of them can cause one.
+  # A blocked switch is recorded as STAY with applied=0 and a BLOCKED_* reason.
+  #
+  # Minimum requests between allowed switches within one session.
+  dwell_requests: 5
+  # A reversal must be proposed this many requests in a row before it is allowed.
+  hysteresis_requests: 3
+  # Extra headroom, in USD, required on top of the estimated rebuild cost.
+  safety_margin_usd: 0.0
+  # Estimated benefit of an escalation, USD. DUMMY VALUES, NOT REAL PRICES.
+  escalate_benefit_usd: 0.001
+  # Estimated benefit of a downgrade, USD. DUMMY VALUES, NOT REAL PRICES.
+  downgrade_benefit_usd: 0.001
+  # When false, the cost check is skipped entirely.
+  # free models have no cache rebuild cost; re-enable when paid models are involved
+  cost_check_enabled: false
+  # When true, block any switch while the latest message is a tool_result.
+  block_in_tool_loop: false
+
+# THE ONE DIFFERENCE FROM tools/sample-config-ACTIVE-test.yaml.
+#
+# `enabled: true` is the whole point of this file: the classifier reads the
+# latest human prompt and may propose a tier switch. The shipped config and the
+# ACTIVE sample both leave this false, and the shipped default must stay false.
+#
+# The keyword lists and weights are identical to the shipped config's, so a test
+# that passes against this file is testing the shipped rules and not a second
+# set of invented ones.
+classifier:
+  enabled: true
+
+  # Each distinct keyword found adds `points.strong`, up to `points.strong_cap`
+  # in total. Matching ignores case.
+  strong_keywords:
+    - refactor
+    - debug
+    - architecture
+    - optimize
+    - implement
+    - migration
+    - concurrency
+    - regression
+
+  # Each distinct keyword found subtracts `points.cheap`, down to no less than
+  # `points.cheap_cap` in total.
+  cheap_keywords:
+    - typo
+    - rename
+    - spell
+    - wording
+    - comment
+    - lint
+    - hello
+
+  # Rule weights. Every one is a plain integer, not a measurement.
+  points:
+    # Score a prompt starts from before any rule is applied.
+    base: 50
+    # Added per distinct strong keyword, never more than strong_cap in total.
+    strong: 25
+    strong_cap: 50
+    # Subtracted per distinct cheap keyword, never more than cheap_cap in total.
+    cheap: -20
+    cheap_cap: -40
+    # A prompt longer than long_chars adds long_points. Longer than
+    # very_long_chars it adds very_long_points as well, so a very long prompt
+    # collects both reasons rather than one replacing the other.
+    long_chars: 200
+    long_points: 10
+    very_long_chars: 600
+    very_long_points: 20
+    # Three or more file-like tokens adds many_files_points.
+    many_files: 3
+    many_files_points: 15
+    # A prompt that is nothing but a single question loses question_points.
+    question_points: -10
+
+  # The score is clamped to 0..100. Below cheap_below the tier is `low`, from
+  # strong_from upwards it is `high`, and everything between the two is `mid`.
+  cheap_below: 35
+  strong_from: 65

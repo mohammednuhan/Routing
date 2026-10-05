@@ -1,0 +1,181 @@
+# TEST VALUES ONLY
+#
+# DUMMY VALUES, NOT REAL PRICES, AND NOT REAL MODELS
+#
+# A copy of tools/sample-config-ACTIVE-test.yaml with the classifier section
+# enabled. Everything in it is invented for testing and describes nothing real.
+# It exists so the classifier can be exercised end to end in active mode
+# without editing the shipped config or the ACTIVE sample.
+#
+# The model ids are `test-low`, `test-mid` and `test-high`. They are not
+# provider model ids and were never meant to be. They exist so that active mode
+# has something legal to rewrite toward: `tamias-router start` refuses to run
+# in active mode while any id still begins with `TODO_`, and these ids do not.
+#
+# Do not point the router at a real upstream with this file. Do not copy any of
+# it into router/config.yaml. The shipped config keeps its prices null and its
+# ids as placeholders precisely because no verified ids or price sheet exist.
+#
+# The dummy numbers are:
+#   cache_write_per_million: 3.75     for test-mid and test-high
+#   cache_read_per_million:  0.30     for test-mid and test-high
+#   input_per_million:       3.00     for test-mid and test-high
+#   output_per_million:     15.00     for test-mid and test-high
+#   escalate_benefit_usd:    0.001
+#   downgrade_benefit_usd:   0.001
+#
+# `test-low` carries 0.0 for all four prices on purpose. Zero is a price, not an
+# absence: it makes test-low a genuinely free model, so the cost tests can tell
+# a free model (cost exactly 0.0) apart from a model whose price nobody has
+# verified (cost UNKNOWN). It is never rounded to null and never read as unknown.
+#
+# `routed_header` is true here so the tests can observe the header. It is false
+# in the shipped config: a header naming a hop the router did not make would be
+# a false claim.
+#
+# Every classifier keyword and weight below is a plain invented rule, copied
+# from router/config.yaml so this file is self-contained. None of it is
+# measured, calibrated or tuned against real traffic. The keywords are ordinary
+# English words, not prompt content: a matched keyword is never stored, logged
+# or written anywhere, only counted.
+
+listen: 127.0.0.1:8787
+upstream: https://api.anthropic.com
+
+# The one mode in which a request body may be changed. Every other mode in this
+# repository forwards every request untouched.
+mode: active
+
+routed_header: true
+
+models:
+  - id: test-low
+    legal_efforts:
+      - test-effort-low
+      - test-effort-medium
+      - test-effort-high
+    cost_tier: low
+    # DUMMY VALUES, NOT REAL PRICES
+    # 0.0 across the board: test-low stands for a genuinely free model, so the
+    # cost tests have a price of zero that is a real price rather than a null.
+    input_per_million: 0.0
+    output_per_million: 0.0
+    cache_write_per_million: 0.0
+    cache_read_per_million: 0.0
+  - id: test-mid
+    legal_efforts:
+      - test-effort-low
+      - test-effort-medium
+      - test-effort-high
+    cost_tier: mid
+    # DUMMY VALUES, NOT REAL PRICES
+    input_per_million: 3.0
+    output_per_million: 15.0
+    cache_write_per_million: 3.75
+    cache_read_per_million: 0.30
+  - id: test-high
+    legal_efforts:
+      - test-effort-low
+      - test-effort-medium
+      - test-effort-high
+    cost_tier: high
+    # DUMMY VALUES, NOT REAL PRICES
+    input_per_million: 3.0
+    output_per_million: 15.0
+    cache_write_per_million: 3.75
+    cache_read_per_million: 0.30
+
+default_model: test-mid
+default_effort: test-effort-medium
+
+# Identical to the shipped policy block. Only the prices and the two benefit
+# figures differ, and those differ from the shipped file by being non-null.
+policy:
+  # Escalate when this many tool results in a row were errors.
+  escalate_consecutive_errors: 2
+  # Escalate when one tool is called this many times in a row.
+  escalate_repeated_tool_calls: 3
+  # Downgrade on small, clean contexts.
+  downgrade_enabled: true
+  downgrade_max_context_tokens: 2000
+  downgrade_max_turn_index: 1
+  # Safety layer. These can only BLOCK a switch; none of them can cause one.
+  # A blocked switch is recorded as STAY with applied=0 and a BLOCKED_* reason.
+  #
+  # Minimum requests between allowed switches within one session.
+  dwell_requests: 5
+  # A reversal must be proposed this many requests in a row before it is allowed.
+  hysteresis_requests: 3
+  # Extra headroom, in USD, required on top of the estimated rebuild cost.
+  safety_margin_usd: 0.0
+  # Estimated benefit of an escalation, USD. DUMMY VALUES, NOT REAL PRICES.
+  escalate_benefit_usd: 0.001
+  # Estimated benefit of a downgrade, USD. DUMMY VALUES, NOT REAL PRICES.
+  downgrade_benefit_usd: 0.001
+  # When false, the cost check is skipped entirely.
+  cost_check_enabled: true
+  # When true, block any switch while the latest message is a tool_result.
+  block_in_tool_loop: false
+
+# THE ONE DIFFERENCE FROM tools/sample-config-ACTIVE-test.yaml.
+#
+# `enabled: true` is the whole point of this file: the classifier reads the
+# latest human prompt and may propose a tier switch. The shipped config and the
+# ACTIVE sample both leave this false, and the shipped default must stay false.
+#
+# The keyword lists and weights are identical to the shipped config's, so a test
+# that passes against this file is testing the shipped rules and not a second
+# set of invented ones.
+classifier:
+  enabled: true
+
+  # Each distinct keyword found adds `points.strong`, up to `points.strong_cap`
+  # in total. Matching ignores case.
+  strong_keywords:
+    - refactor
+    - debug
+    - architecture
+    - optimize
+    - implement
+    - migration
+    - concurrency
+    - regression
+
+  # Each distinct keyword found subtracts `points.cheap`, down to no less than
+  # `points.cheap_cap` in total.
+  cheap_keywords:
+    - typo
+    - rename
+    - spell
+    - wording
+    - comment
+    - lint
+    - hello
+
+  # Rule weights. Every one is a plain integer, not a measurement.
+  points:
+    # Score a prompt starts from before any rule is applied.
+    base: 50
+    # Added per distinct strong keyword, never more than strong_cap in total.
+    strong: 25
+    strong_cap: 50
+    # Subtracted per distinct cheap keyword, never more than cheap_cap in total.
+    cheap: -20
+    cheap_cap: -40
+    # A prompt longer than long_chars adds long_points. Longer than
+    # very_long_chars it adds very_long_points as well, so a very long prompt
+    # collects both reasons rather than one replacing the other.
+    long_chars: 200
+    long_points: 10
+    very_long_chars: 600
+    very_long_points: 20
+    # Three or more file-like tokens adds many_files_points.
+    many_files: 3
+    many_files_points: 15
+    # A prompt that is nothing but a single question loses question_points.
+    question_points: -10
+
+  # The score is clamped to 0..100. Below cheap_below the tier is `low`, from
+  # strong_from upwards it is `high`, and everything between the two is `mid`.
+  cheap_below: 35
+  strong_from: 65

@@ -1,5 +1,5 @@
 """tamias-router command line: `status`, `start`, `log`, `report`,
-`ledger-info`, `switch-report` and `classify`.
+`ledger-info`, `switch-report`, `watch` and `classify`.
 
 `status` reads the config and prints it. It makes no network calls. `start`
 validates the config and runs the transparent loopback proxy; it makes no
@@ -8,9 +8,11 @@ never contain request or response content. `report` counts those same rows and
 `ledger-info` prints a SQLite file's schema; both open their database read-only
 and neither can write a row. `switch-report` correlates approved switches with
 the rows the Tamias Observer ledger recorded around the same time, by time
-alone, and says so. `classify` scores one prompt given on the command line with
-the configured classifier rules, as a dry run: it prints a score, a tier and
-reason codes, and writes nothing anywhere.
+alone, and says so. `watch` prints decisions and estimated cost as they arrive,
+polling the log read-only and printing a running footer; it re-prices nothing,
+because each usage row already carries what it cost. `classify` scores one prompt
+given on the command line with the configured classifier rules, as a dry run: it
+prints a score, a tier and reason codes, and writes nothing anywhere.
 """
 from __future__ import annotations
 
@@ -64,6 +66,8 @@ from .switch_report import (
     parse_timestamp,
     switch_report_as_json,
 )
+from .watch import DEFAULT_INTERVAL as DEFAULT_WATCH_INTERVAL
+from .watch import WatchOptions, run as run_watch
 
 PROG = "tamias-router"
 
@@ -236,6 +240,45 @@ def build_parser() -> argparse.ArgumentParser:
         help="print one JSON object instead of the text report",
     )
 
+    watch = sub.add_parser(
+        "watch",
+        help=(
+            "print routing decisions and estimated cost as they arrive "
+            "(read-only; opens the database with mode=ro and never writes)"
+        ),
+    )
+    watch.add_argument(
+        "--interval",
+        type=float,
+        default=DEFAULT_WATCH_INTERVAL,
+        metavar="SECONDS",
+        help=f"seconds between polls (default {DEFAULT_WATCH_INTERVAL})",
+    )
+    watch.add_argument(
+        "--since",
+        default=None,
+        metavar="ISO_TIMESTAMP",
+        help="start from this UTC timestamp instead of the last few rows",
+    )
+    watch.add_argument(
+        "--once",
+        action="store_true",
+        help="print the current state once and exit 0",
+    )
+    watch.add_argument(
+        "--max-iterations",
+        type=int,
+        default=None,
+        metavar="N",
+        help="stop after N polls and exit 0 (for tests)",
+    )
+    watch.add_argument(
+        "--no-color",
+        dest="no_color",
+        action="store_true",
+        help="never emit colour; the default, and always on when output is not a terminal",
+    )
+
     classify = sub.add_parser(
         "classify",
         help=(
@@ -383,6 +426,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "switch-report":
         return _switch_report(args)
 
+    if args.cmd == "watch":
+        return _watch(args)
+
     config = load_config_or_exit(args.config)
 
     if args.cmd == "status":
@@ -514,6 +560,60 @@ def _cost(args: argparse.Namespace) -> int:
     # in it too.
     print(cost_as_json(report) if args.as_json else format_cost_report(report))
     return 0
+
+
+def _watch(args: argparse.Namespace) -> int:
+    """Print decisions and estimated cost as they arrive. Read-only.
+
+    No config is loaded and no price is computed: every usage row already carries
+    what it cost, priced by the proxy from the config it was running with. This
+    command opens the database with `mode=ro`, so it cannot create one, write a
+    row or leave a journal behind.
+
+    An absent database is not a failure. Nothing has been logged yet, so the view
+    waits and keeps polling, which is the whole point of starting a watch before
+    the proxy.
+
+    `--once` and `--max-iterations` both exit 0 deliberately: a bounded watch
+    finished its job, and a non-zero code would read as a failure that did not
+    happen.
+    """
+    if args.interval <= 0:
+        print(f"{PROG}: --interval must be greater than 0, got {args.interval}", file=sys.stderr)
+        return 2
+    if args.max_iterations is not None and args.max_iterations < 1:
+        print(
+            f"{PROG}: --max-iterations must be 1 or more, got {args.max_iterations}",
+            file=sys.stderr,
+        )
+        return 2
+
+    since = None
+    if args.since is not None:
+        try:
+            since = parse_since(args.since)
+        except ValueError as exc:
+            print(f"{PROG}: --since {exc}", file=sys.stderr)
+            return 2
+
+    # Colour only when asked for AND writing to a terminal. `isatty` is guarded
+    # because a caller may hand `write` a stream that has no such method.
+    if args.no_color:
+        color = False
+    else:
+        try:
+            color = sys.stdout.isatty()
+        except (AttributeError, ValueError):
+            color = False
+
+    options = WatchOptions(
+        interval=args.interval,
+        since=since,
+        once=args.once,
+        max_iterations=args.max_iterations,
+        color=color,
+    )
+    return run_watch(default_db_path(), options)
 
 
 def _ledger_info(path: Path) -> int:

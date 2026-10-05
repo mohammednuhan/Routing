@@ -19,6 +19,14 @@ on and logged by the same pipeline; `signal_values` carries the format under
 `api_format` so a row says which one it was. Any other path is forwarded and
 recorded nowhere, exactly as before.
 
+Each recognised response also produces one `router_usage` row, written after the
+response has ended: the token counts the upstream reported and what they cost at
+the config's prices. The extractor is picked by the same `api_format`, so an
+OpenAI response is read as an OpenAI response, and both paths write the same
+columns with the same meanings - see `router/usage.py` and `router/cost.py`. The
+parser is fed a copy of each chunk after those exact bytes are on the wire, so it
+can cost a row and nothing else.
+
 Streaming responses are relayed chunk by chunk as they arrive and flushed after
 each chunk; the whole response is never buffered.
 
@@ -64,7 +72,7 @@ from .killswitch import REASON_KILL_SWITCH, read_kill_switch
 from .hold import HELD_SIGNAL_KEY, apply_hold
 from .classifier import classify_prompt
 from .cost import estimate_cost
-from .usage import UsageParser, UsageRecord
+from .usage import OpenAIUsageParser, UsageParser, UsageRecord
 from .signals import Signals, compute_signals
 from .signals_openai import compute_signals_openai
 from .policy import decide
@@ -143,6 +151,26 @@ def detect_api_format(path: str) -> str | None:
         return API_FORMAT_ANTHROPIC
     if route.endswith(OPENAI_PATH_SUFFIX):
         return API_FORMAT_OPENAI
+    return None
+
+
+def usage_parser_class(api_format: str | None) -> type[UsageParser] | None:
+    """The extractor that reads `api_format`'s response, or None for no format.
+
+    The two formats carry their counts in differently named fields and neither can
+    be read as the other, so the request's `api_format` - the path, and nothing
+    else - is what selects one. Both extractors return the same `UsageRecord` and
+    are written into the same `router_usage` row, so no report downstream of this
+    can tell which format answered.
+
+    Looked up when the response arrives rather than bound at import, so the class
+    in force is the one this module holds at the moment it is asked to read a
+    body.
+    """
+    if api_format == API_FORMAT_ANTHROPIC:
+        return UsageParser
+    if api_format == API_FORMAT_OPENAI:
+        return OpenAIUsageParser
     return None
 
 
@@ -863,12 +891,16 @@ class ProxyHandler(BaseHTTPRequestHandler):
         return (rewritten, None)
 
     def _record_usage(self, decision_id: int | None, plan: RoutingPlan | None) -> None:
-        """Append one `router_usage` row for a POST to /v1/messages.
+        """Append one `router_usage` row for a POST in either recognised format.
 
         Runs after the response has ended and after the decision row exists, so
         the usage row can link to it. Counts come from the upstream, prices from
         the config, and neither is ever invented: an unknown figure is written
         as NULL, which is a different claim from 0.0.
+
+        The row is written exactly as it is for Anthropic. Both extractors return
+        the same `UsageRecord` and the same columns mean the same thing on both
+        paths, so nothing below this line can tell which format answered.
 
         A failure here is reported as one short line and never affects anything:
         the response is already complete and the decision row is already
@@ -1200,15 +1232,20 @@ class ProxyHandler(BaseHTTPRequestHandler):
     def _usage_parser(self, response: http.client.HTTPResponse) -> UsageParser | None:
         """A parser for this response, or None when nothing is worth parsing.
 
-        Only a `POST /v1/messages` response is priced, so every other request
-        gets no parser at all and pays nothing for the feature. Construction can
-        raise on an odd header, so a failure here means "no row", never a
-        changed response.
+        Only a POST in one of the two formats the router prices gets a parser, so
+        every other request gets none at all and pays nothing for the feature. The
+        extractor is picked by the request's format, because a chat-completions
+        response and a Messages response are read differently and neither can be
+        read as the other. Construction can raise on an odd header, so a failure
+        here means "no row", never a changed response.
         """
         if not self._records_usage:
             return None
+        parser_class = usage_parser_class(detect_api_format(self.path))
+        if parser_class is None:
+            return None
         try:
-            return UsageParser(
+            return parser_class(
                 response.status,
                 content_encoding=response.getheader("Content-Encoding") or "",
                 content_type=response.getheader("Content-Type") or "",
@@ -1246,14 +1283,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
     @property
     def _records_usage(self) -> bool:
-        """True only for a `POST /v1/messages`: the one response that is priced.
+        """True only for a POST in a format the router prices.
 
-        Deliberately still Anthropic-only. Pricing an OpenAI-format response is
-        a separate change, with its own counts and its own table semantics, and
-        an unpriced format must record no usage row at all rather than a
-        half-filled one.
+        Both recognised formats are priced: Anthropic Messages and OpenAI chat
+        completions. What decides that is `detect_api_format` and nothing else, so
+        it is exactly the set of requests that get a decision row, and a path that
+        names no format is forwarded and recorded nowhere - no decision row and no
+        usage row, rather than a half-filled one.
         """
-        return self.command == "POST" and self.path.split("?", 1)[0] == MESSAGES_PATH
+        return self.command == "POST" and detect_api_format(self.path) is not None
 
     def _reply_json(self, status: int, code: str, message: str) -> None:
         """A short JSON error. Carries no header, body or credential material."""

@@ -58,6 +58,7 @@ from router.safety import is_blocked
 from router.signals import Signals, compute_signals
 from router.signals_openai import compute_signals_openai
 from router.state import SessionStore
+from router.usage import STATUS_UNKNOWN
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 OPENAI_CONFIG_PATH = REPO_ROOT / "tools" / "sample-config-OPENAI-test.yaml"
@@ -329,6 +330,18 @@ def wait_for_rows(log: DecisionLog, expected: int, timeout: float = 5.0) -> int:
     while count < expected and time.monotonic() < deadline:
         time.sleep(0.01)
         count = log.count()
+    return count
+
+
+def wait_for_usage(log: DecisionLog, expected: int, timeout: float = 5.0) -> int:
+    """The usage row is written after the response has ended, so it can trail it."""
+    import time
+
+    deadline = time.monotonic() + timeout
+    count = log.usage_count()
+    while count < expected and time.monotonic() < deadline:
+        time.sleep(0.01)
+        count = log.usage_count()
     return count
 
 
@@ -1060,12 +1073,13 @@ def test_an_openai_path_records_a_row_even_when_the_body_is_not_json(tmp_path, m
         assert row.signal_values[API_FORMAT_SIGNAL_KEY] == API_FORMAT_OPENAI
 
 
-def test_an_openai_request_records_no_usage_row(tmp_path, monkeypatch):
-    """Pricing stays Anthropic-only: no row, not a half-filled one.
+def test_an_openai_request_records_one_usage_row(tmp_path, monkeypatch):
+    """The format is priced like any other: one row per response, and a row that
+    says UNKNOWN rather than nothing when the response reported no counts.
 
-    The fake upstream replies with a response that carries counts in it, so this
-    is not the absence of something to record but the router declining to price
-    a format it has no price sheet for.
+    `USAGE_RESPONSE` is a Messages-shaped body, so the OpenAI extractor finds no
+    `prompt_tokens` in it and the row carries UNKNOWN. That is the point: one row
+    per response, honestly labelled, instead of no row at all.
     """
     log = log_at(tmp_path, monkeypatch)
     body = repeat_tool_body()
@@ -1074,8 +1088,14 @@ def test_an_openai_request_records_no_usage_row(tmp_path, monkeypatch):
         harness.respond(USAGE_RESPONSE)
         request(harness.proxy_port, body)
         assert wait_for_rows(log, 1) == 1
+        assert wait_for_usage(log, 1) == 1
 
-        assert log.usage_count() == 0
+        assert log.usage_count() == 1
+        stored = log.usage_rows(1)[0]
+        assert stored.status == STATUS_UNKNOWN
+        assert stored.input_tokens is None
+        assert stored.output_tokens is None
+        assert stored.cost_usd is None
         assert json.loads(harness.forwarded.body)["model"] == MODEL_HIGH
 
 

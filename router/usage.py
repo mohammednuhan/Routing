@@ -21,6 +21,12 @@ Two shapes of response are understood:
 * an SSE stream, parsed event by event as the chunks arrive, so an event split
   across two chunks is still read once it completes.
 
+Both response formats are read, each by its own extractor: `UsageParser` for
+Anthropic Messages and `OpenAIUsageParser` for chat completions. The choice is
+made by the proxy from the request's `api_format` and by nothing else. Both
+produce the same `UsageRecord`, so `router/cost.py` and every report downstream
+are unchanged by which format answered.
+
 Statuses
 --------
 
@@ -81,6 +87,20 @@ EVENT_MESSAGE_DELTA: Final = "message_delta"
 
 #: `Content-Type` that means the body is a stream of SSE events.
 SSE_CONTENT_TYPE: Final = "text/event-stream"
+
+#: The `data:` payload that ends an SSE stream. It is not JSON, so it is
+#: recognized rather than parsed: the end of a stream is not a parse failure.
+SSE_DONE: Final = b"[DONE]"
+
+#: Names a provider may give the cache-write count inside
+#: `usage.prompt_tokens_details`. OpenAI's own schema has no cache-write field, so
+#: these are the names the gateways that report one use; the first that is present
+#: and numeric is taken, and a provider reporting none leaves the count unknown.
+CACHE_WRITE_DETAIL_KEYS: Final = (
+    "cache_write_tokens",
+    "cache_creation_tokens",
+    "cache_creation_input_tokens",
+)
 
 
 @dataclass(frozen=True)
@@ -388,16 +408,170 @@ class UsageParser:
         self._saw_counts = True
 
 
+class OpenAIUsageParser(UsageParser):
+    """Reads usage out of a chat-completions response, keeping only numbers.
+
+    Everything `UsageParser` already guarantees is inherited unchanged: gzip is
+    decompressed on this module's copy and nowhere else, an unsupported encoding
+    or a status of 400 and above settles the status before a byte is parsed, a
+    body that names a model but reports no counts is UNKNOWN rather than 0, and
+    no method raises. Only the shape of the response differs.
+
+    Two shapes are read:
+
+    * one JSON body whose `usage` object carries `prompt_tokens`,
+      `completion_tokens` and, optionally, `prompt_tokens_details.cached_tokens`;
+    * an SSE stream of `data: {json}` chunks terminated by `data: [DONE]`, where
+      the counts are taken from whichever chunk reports a non-null `usage` object
+      - conventionally a final chunk whose `choices` list is empty - and the
+      model from the first chunk that names one.
+
+    Normalization
+    -------------
+    OpenAI reports `prompt_tokens` as a total that *includes* the tokens served
+    from cache, while the `router_usage` columns mean something narrower:
+    `input_tokens` is the tokens that were not read from cache and
+    `cache_read_tokens` is the ones that were. So the total is split here, once,
+    on the way in:
+
+        input_tokens      = prompt_tokens - cached_tokens
+        cache_read_tokens = cached_tokens
+        output_tokens     = completion_tokens
+
+    Splitting rather than storing the total is what keeps `router/cost.py`
+    correct unchanged: it prices `input_tokens` at the input rate and
+    `cache_read_tokens` at the much lower cache-read rate, and pricing a total
+    that already contains the cached tokens would bill them twice. When the
+    provider reports no `cached_tokens` the split cannot be done, so
+    `input_tokens` is the whole total and `cache_read_tokens` stays NULL: the
+    figure is recorded as nobody having told us, which is what happened.
+
+    The router never asks for usage. Whether a stream carries a `usage` object at
+    all is the client's decision - it depends on `stream_options` in the request -
+    and the request is forwarded byte for byte, so this extractor reads what
+    arrived and says UNKNOWN when that is nothing. It never adds a field to the
+    request to improve its own answer.
+    """
+
+    def _read_json_body(self, body: bytes) -> None:
+        payload = json.loads(body.decode("utf-8"))
+        if not isinstance(payload, dict):
+            return
+        self._read_openai_usage(payload.get("usage"))
+        self.model_reported = _as_text(payload.get("model"))
+
+    def _read_openai_usage(self, usage: Any) -> None:
+        """Take the counts from a chat-completions `usage` object, and nothing else.
+
+        Every count is optional and read independently, so a provider that reports
+        two of the four is stored as two known counts and two NULLs rather than as
+        four guesses.
+        """
+        if not isinstance(usage, dict):
+            return
+        details = usage.get("prompt_tokens_details")
+        details = details if isinstance(details, dict) else {}
+
+        prompt = _as_int(usage.get("prompt_tokens"))
+        cached = _as_int(details.get("cached_tokens"))
+        if cached is not None and prompt is not None and cached > prompt:
+            # `prompt_tokens` is inclusive, so a cache read larger than the total
+            # cannot be right and neither figure can be trusted. UNKNOWN is the
+            # honest reading; a subtraction that came out negative is not.
+            self._fail()
+            return
+
+        # The split described in the class docstring. Done here, on the copy, so
+        # that every consumer of the columns downstream prices cache tokens once.
+        # A cache read reported without a total cannot be subtracted from, so the
+        # input count stays NULL rather than becoming the cache read itself.
+        if prompt is None:
+            input_value = None
+        elif cached is None:
+            input_value = prompt
+        else:
+            input_value = prompt - cached
+
+        self._take("input", input_value)
+        self._take("output", _as_int(usage.get("completion_tokens")))
+        self._take("cache_read", cached)
+        self._take("cache_write", self._cache_write(details))
+
+    @staticmethod
+    def _cache_write(details: dict[str, Any]) -> int | None:
+        """The cache-write count from `prompt_tokens_details`, or None.
+
+        Optional in this format: OpenAI's own schema has no such field, so a
+        provider that does not report one leaves `cache_write_tokens` NULL.
+        """
+        for name in CACHE_WRITE_DETAIL_KEYS:
+            value = _as_int(details.get(name))
+            if value is not None:
+                return value
+        return None
+
+    def _handle_event(self, event: bytes) -> None:
+        """Read one complete SSE event's `data:` payloads.
+
+        A chat-completions event carries no `event:` name to filter on, so every
+        event is read and the counts are taken from whichever of them reports a
+        `usage` object. That means the chunk holding the assistant delta is
+        decoded - it has to be, to reach the `usage` beside it - and dropped
+        whole: the only things taken from it are the model id and the counts, so
+        no response text survives the event that carried it.
+        """
+        data: list[bytes] = []
+        for line in event.split(b"\n"):
+            if not line or line.startswith(b":"):
+                # A blank line or a comment (often a keep-alive ping).
+                continue
+            field, separator, value = line.partition(b":")
+            if not separator:
+                continue
+            if value.startswith(b" "):
+                value = value[1:]
+            if field == b"data":
+                data.append(value)
+
+        if data:
+            self._read_chunk(b"\n".join(data))
+
+    def _read_chunk(self, payload: bytes) -> None:
+        """Read one SSE `data:` payload: a JSON chunk, or the end marker.
+
+        A payload that is not the JSON it claims to be is discarded and reading
+        continues. A stream is many payloads and one unreadable one must not throw
+        away the counts already read, so this returns rather than failing.
+        """
+        if payload.strip() == SSE_DONE:
+            return
+        try:
+            chunk = json.loads(payload.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            return
+        if not isinstance(chunk, dict):
+            return
+        # A null `usage` is the ordinary shape of every chunk before the last, so
+        # only a non-null one is read. `choices` is never looked at: the assistant
+        # text lives there and it is not this module's business.
+        self._read_openai_usage(chunk.get("usage"))
+        if self.model_reported is None:
+            self.model_reported = _as_text(chunk.get("model"))
+
+
 __all__ = [
+    "CACHE_WRITE_DETAIL_KEYS",
     "EVENT_MESSAGE_DELTA",
     "EVENT_MESSAGE_START",
     "LEGAL_STATUSES",
     "MAX_JSON_BYTES",
     "MAX_SSE_EVENT_BYTES",
     "NO_USAGE_FROM_STATUS",
+    "SSE_DONE",
     "STATUS_NO_USAGE",
     "STATUS_OK",
     "STATUS_UNKNOWN",
+    "OpenAIUsageParser",
     "UsageParser",
     "UsageRecord",
 ]

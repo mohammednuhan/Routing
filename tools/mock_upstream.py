@@ -11,21 +11,26 @@ Standard library only. Routes:
                         message_delta) carrying usage too
     POST /v1/chat/completions
                      -> the same report, with the effort read from
-                        "reasoning_effort" or "reasoning.effort"
+                        "reasoning_effort" or "reasoning.effort", and the
+                        OpenAI usage shape
+                        or, when the request asked to stream, an SSE sequence
+                        of 4 chunks (model + delta, finish_reason, usage with an
+                        empty "choices", then "data: [DONE]")
     GET  /static       -> a fixed non-streaming body
     GET  /stream       -> 3 SSE chunks, one per second, chunked
     GET  /status/<n>   -> HTTP <n> with a small body
     anything else      -> HTTP 404
 
-The usage counts are fixed, invented numbers, and `TEST_PHRASE` is a phrase no
-test should ever find in the router's database or logs. It exists in the
-`content_block_delta` event of the streaming response precisely so the tests can
-prove the phrase in an assistant response never gets stored.
+The usage counts are fixed, invented numbers. `TEST_PHRASE` and
+`CHAT_TEST_PHRASE` are phrases no test should ever find in the router's database
+or logs. They exist only in the assistant text of the two streaming responses -
+`TEST_PHRASE` in a `content_block_delta` event, `CHAT_TEST_PHRASE` in a
+chat-completions `delta.content` - precisely so the tests can prove the phrase in
+an assistant response never gets stored.
 
-The chat-completions route answers with a report even when the request asked to
-stream: this tool fakes the Anthropic SSE sequence and nothing else. A manual
-test of an OpenAI stream should expect that difference, and the tests use the
-non-streaming form.
+The chat-completions route reports `prompt_tokens` the way OpenAI does: as a
+total that includes `prompt_tokens_details.cached_tokens`, which is what the
+router's own normalization is written against.
 
 Run it, then point the proxy at it:
 
@@ -55,11 +60,24 @@ CHUNK_INTERVAL_SECONDS = 1.0
 #: assert it never reaches the router's database, logs or cost report.
 TEST_PHRASE = "seaglass-lantern-4417-mock"
 
+#: The same idea for the chat-completions stream, in a delta of its own, so a test
+#: can prove the phrase in an OpenAI-format response is not stored either.
+CHAT_TEST_PHRASE = "seaglass-lantern-4417-chat"
+
 #: Invented counts, so the cost report has something to price. Never real.
 MOCK_INPUT_TOKENS = 120
 MOCK_OUTPUT_TOKENS = 45
 MOCK_CACHE_READ_TOKENS = 800
 MOCK_CACHE_WRITE_TOKENS = 200
+
+#: The OpenAI-format counts the chat-completions route reports. `prompt_tokens` is
+#: a total that *includes* `prompt_tokens_details.cached_tokens`, exactly as OpenAI
+#: defines it. This mock serves no cache, so the cached part of that total is 0
+#: and `prompt_tokens` is the whole prompt: the end-to-end tests therefore drive
+#: the router's normalization against its zero case, and the non-zero case is
+#: driven by bodies the tests build themselves.
+MOCK_PROMPT_TOKENS = MOCK_INPUT_TOKENS
+MOCK_CACHED_TOKENS = 0
 
 #: The model the mock claims to have served. Fixed, so a MODEL_MISMATCH test
 #: can ask for a different one and see the note appear.
@@ -73,6 +91,21 @@ def _usage_payload() -> dict[str, int]:
         "output_tokens": MOCK_OUTPUT_TOKENS,
         "cache_read_input_tokens": MOCK_CACHE_READ_TOKENS,
         "cache_creation_input_tokens": MOCK_CACHE_WRITE_TOKENS,
+    }
+
+
+def _chat_usage_payload() -> dict[str, object]:
+    """The `usage` object a `/v1/chat/completions` response reports.
+
+    OpenAI's shape: `prompt_tokens` is the whole prompt including whatever came
+    from cache, and `prompt_tokens_details` says how much of it did. No cache
+    write is reported, because OpenAI has no field for one.
+    """
+    return {
+        "prompt_tokens": MOCK_PROMPT_TOKENS,
+        "completion_tokens": MOCK_OUTPUT_TOKENS,
+        "total_tokens": MOCK_PROMPT_TOKENS + MOCK_OUTPUT_TOKENS,
+        "prompt_tokens_details": {"cached_tokens": MOCK_CACHED_TOKENS},
     }
 
 
@@ -116,6 +149,57 @@ MESSAGES_STREAM_CHUNKS = [
             "usage": {"output_tokens": MOCK_OUTPUT_TOKENS},
         },
     ),
+]
+
+
+def _data(payload: object) -> bytes:
+    """One unnamed SSE event as bytes, terminated by a blank line."""
+    return f"data: {json.dumps(payload)}\n\n".encode()
+
+
+#: The chat-completions stream, in four separate chunks: the first names the model
+#: and carries the assistant text once, the second ends the choice, the third is
+#: the counts alone with an empty `choices` list, and the fourth is the end marker
+#: that is not JSON at all. `usage` is null on the first two, which is what a
+#: provider that only reports counts at the end sends.
+CHAT_STREAM_CHUNKS = [
+    _data(
+        {
+            "id": "chatcmpl-mock-0001",
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": MOCK_MODEL,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"role": "assistant", "content": CHAT_TEST_PHRASE},
+                    "finish_reason": None,
+                }
+            ],
+            "usage": None,
+        }
+    ),
+    _data(
+        {
+            "id": "chatcmpl-mock-0001",
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": MOCK_MODEL,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            "usage": None,
+        }
+    ),
+    _data(
+        {
+            "id": "chatcmpl-mock-0001",
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": MOCK_MODEL,
+            "choices": [],
+            "usage": _chat_usage_payload(),
+        }
+    ),
+    b"data: [DONE]\n\n",
 ]
 
 
@@ -221,8 +305,9 @@ class MockUpstreamHandler(BaseHTTPRequestHandler):
 
         The same metadata report as `/v1/messages`, and for the same reason: the
         message list is never returned, only how many messages arrived, so this
-        tool cannot become a place where request content is stored. Streaming is
-        not faked here - see the module docstring.
+        tool cannot become a place where request content is stored. A request that
+        asked to stream gets the SSE sequence instead, the way a real gateway
+        answers it.
         """
         try:
             payload = json.loads(body.decode("utf-8"))
@@ -239,14 +324,34 @@ class MockUpstreamHandler(BaseHTTPRequestHandler):
             report["effort"] = _openai_effort_of(payload)
             report["stream"] = payload.get("stream")
             report["messages"] = len(payload.get("messages") or [])
-            report["usage"] = {
-                "prompt_tokens": MOCK_INPUT_TOKENS,
-                "completion_tokens": MOCK_OUTPUT_TOKENS,
-            }
+            report["usage"] = _chat_usage_payload()
         else:
             report["json"] = False
 
+        if isinstance(payload, dict) and payload.get("stream") is True:
+            self._chat_stream()
+            return
+
         self._send(200, json.dumps(report).encode(), "application/json")
+
+    def _chat_stream(self) -> None:
+        """The four-chunk SSE sequence a streaming chat completion returns.
+
+        Each chunk is written and flushed on its own, so a proxy that relays it
+        incrementally delivers the first chunk before the last one exists. The
+        first chunk carries the assistant text, which is the thing the router must
+        parse past without keeping, and the third carries the counts alone.
+        """
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+        for chunk in CHAT_STREAM_CHUNKS:
+            self.wfile.write(b"%x\r\n" % len(chunk) + chunk + b"\r\n")
+            self.wfile.flush()
+        self.wfile.write(b"0\r\n\r\n")
+        self.wfile.flush()
 
     def _messages(self, body: bytes) -> None:
         """Report what a `/v1/messages` request carried, as JSON.

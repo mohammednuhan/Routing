@@ -131,7 +131,7 @@ CREATE TABLE IF NOT EXISTS {USAGE_TABLE} (
     output_tokens      INTEGER,
     cache_read_tokens  INTEGER,
     cache_write_tokens INTEGER,
-    status             TEXT    NOT NULL CHECK (status IN {USAGE_STATUSES!r},
+    status             TEXT    NOT NULL CHECK (status IN {USAGE_STATUSES!r}),
     cost_usd           REAL,
     baseline_cost_usd  REAL,
     notes              TEXT
@@ -402,6 +402,53 @@ class DecisionLog:
                 cursor = connection.execute(_INSERT, self._row_values(decision, index))
             return int(cursor.lastrowid or 0)
 
+    def record_usage(self, usage: UsageRow) -> int:
+        """Append one usage row, one per response. Returns its `usage_id`.
+
+        Raises whatever sqlite or the filesystem raises; the caller decides
+        whether that is survivable. Nothing here can change a response that has
+        already been relayed.
+        """
+        with self._connect() as connection:
+            cursor = connection.execute(_USAGE_INSERT, self._usage_values(usage))
+            return int(cursor.lastrowid or 0)
+
+    def usage_rows(self, limit: int = 10) -> list[StoredUsage]:
+        """The newest usage rows first."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT {', '.join(_USAGE_COLUMNS)} FROM {USAGE_TABLE} "
+                "ORDER BY usage_id DESC LIMIT ?",
+                (max(1, int(limit)),),
+            ).fetchall()
+        return [self._to_usage_row(row) for row in rows]
+
+    def usage_count(self) -> int:
+        """Total usage rows."""
+        with self._connect() as connection:
+            row = connection.execute(f"SELECT COUNT(*) FROM {USAGE_TABLE}").fetchone()
+        return int(row[0])
+
+    def usage_column_names(self) -> list[str]:
+        """The live usage column names, for verifying Rule 1 against reality."""
+        with self._connect() as connection:
+            rows = connection.execute(f"PRAGMA table_info({USAGE_TABLE})").fetchall()
+        return [str(row[1]) for row in rows]
+
+    def _usage_values(self, usage: UsageRow) -> tuple[Any, ...]:
+        return (
+            usage.decision_id,
+            usage.model_reported,
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.cache_read_tokens,
+            usage.cache_write_tokens,
+            usage.status,
+            usage.cost_usd,
+            usage.baseline_cost_usd,
+            usage.notes,
+        )
+
     def _row_values(self, decision: DecisionRecord, index: int) -> tuple[Any, ...]:
         return (
             decision.timestamp or utc_timestamp(),
@@ -445,6 +492,22 @@ class DecisionLog:
         with self._connect() as connection:
             rows = connection.execute("PRAGMA table_info(router_decisions)").fetchall()
         return [str(row[1]) for row in rows]
+
+    def _to_usage_row(self, row: tuple[Any, ...]) -> StoredUsage:
+        values = dict(zip(_USAGE_COLUMNS, row, strict=True))
+        return StoredUsage(
+            usage_id=int(values["usage_id"]),
+            decision_id=values["decision_id"],
+            model_reported=values["model_reported"],
+            input_tokens=values["input_tokens"],
+            output_tokens=values["output_tokens"],
+            cache_read_tokens=values["cache_read_tokens"],
+            cache_write_tokens=values["cache_write_tokens"],
+            status=str(values["status"]),
+            cost_usd=values["cost_usd"],
+            baseline_cost_usd=values["baseline_cost_usd"],
+            notes=values["notes"],
+        )
 
     def _to_row(self, row: tuple[Any, ...]) -> DecisionRow:
         values = dict(zip(_COLUMNS, row, strict=True))
@@ -502,7 +565,11 @@ class DecisionLog:
         try:
             connection.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
             if not self._schema_ready:
-                connection.executescript(SCHEMA)
+                # Both scripts are additive: `CREATE TABLE IF NOT EXISTS` and
+                # `CREATE INDEX IF NOT EXISTS` only ever add. A database written
+                # before `router_usage` existed gains the table here and keeps
+                # every row it already had.
+                connection.executescript(SCHEMA + USAGE_SCHEMA)
                 self._schema_ready = True
             yield connection
         finally:

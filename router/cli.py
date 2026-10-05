@@ -1,5 +1,5 @@
 """tamias-router command line: `status`, `start`, `log`, `report`,
-`ledger-info` and `switch-report`.
+`ledger-info`, `switch-report` and `classify`.
 
 `status` reads the config and prints it. It makes no network calls. `start`
 validates the config and runs the transparent loopback proxy; it makes no
@@ -8,7 +8,9 @@ never contain request or response content. `report` counts those same rows and
 `ledger-info` prints a SQLite file's schema; both open their database read-only
 and neither can write a row. `switch-report` correlates approved switches with
 the rows the Tamias Observer ledger recorded around the same time, by time
-alone, and says so.
+alone, and says so. `classify` scores one prompt given on the command line with
+the configured classifier rules, as a dry run: it prints a score, a tier and
+reason codes, and writes nothing anywhere.
 """
 from __future__ import annotations
 
@@ -18,7 +20,15 @@ import sys
 from pathlib import Path
 
 from .breaker import REASON_CIRCUIT_OPEN
+from .classifier import TaskClass, classify_prompt
 from .config import DEFAULT_CONFIG_PATH, RouterConfig, load_config_or_exit
+from .cost_report import (
+    COST_NOTE,
+    NOTHING_RECORDED as NOTHING_PRICED,
+    build_cost_report,
+    cost_as_json,
+    format_cost_report,
+)
 from .decisions import DecisionLog, DecisionRow, default_db_path
 from .killswitch import (
     KILL_SWITCH_FILENAME,
@@ -152,6 +162,32 @@ def build_parser() -> argparse.ArgumentParser:
         help="path to the SQLite file to inspect",
     )
 
+    cost = sub.add_parser(
+        "cost",
+        help="price the recorded token counts (read-only, an estimate, not a bill)",
+    )
+    cost.add_argument(
+        "--since",
+        default=None,
+        metavar="ISO_TIMESTAMP",
+        help="only responses at or after this UTC timestamp, e.g. 2026-10-01T00:00:00Z",
+    )
+    cost.add_argument(
+        "--last", type=int, default=None, metavar="N", help="only the newest N responses"
+    )
+    cost.add_argument(
+        "--session",
+        default=None,
+        metavar="HINT",
+        help="only responses whose decision row has this session_hint",
+    )
+    cost.add_argument(
+        "--json",
+        dest="as_json",
+        action="store_true",
+        help="print one JSON object instead of the text report",
+    )
+
     switch = sub.add_parser(
         "switch-report",
         help=(
@@ -199,6 +235,19 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="print one JSON object instead of the text report",
     )
+
+    classify = sub.add_parser(
+        "classify",
+        help=(
+            "score a prompt given on the command line with the configured rules "
+            "(a dry run: stores nothing)"
+        ),
+    )
+    classify.add_argument(
+        "prompt",
+        metavar="PROMPT",
+        help='the prompt to score, e.g. tamias-router classify "fix the typo in cli.py"',
+    )
     return parser
 
 
@@ -217,6 +266,50 @@ def format_status(config: RouterConfig, switch: KillSwitch | None = None) -> str
     lines = [f"{PROG} status"]
     lines.extend(f"{name.ljust(width)} : {value}" for name, value in fields)
     return "\n".join(lines)
+
+
+def format_classify(result: TaskClass) -> str:
+    """The score, the tier and the reason codes. Nothing else.
+
+    A matched keyword is prompt text, so it can never be printed here, and
+    neither can the prompt itself: both would be Rule 1 written to a terminal.
+    """
+    fields = (
+        ("score", str(result.score)),
+        ("tier", result.tier),
+        ("reason_codes", " ".join(result.reason_codes) or "-"),
+    )
+    width = max(len(name) for name, _ in fields)
+    lines = [f"{PROG} classify"]
+    lines.extend(f"{name.ljust(width)} : {value}" for name, value in fields)
+    return "\n".join(lines)
+
+
+def _classify(prompt: str, config: RouterConfig) -> int:
+    """Score one prompt typed on the command line. Stores nothing, logs nothing.
+
+    A dry run for tuning `classifier:` in the config. The prompt is held in
+    memory for the length of this call and dropped; no row is written, no
+    request exists and no model is touched. Because the rules are the config's,
+    a disabled section classifies nothing and says so.
+    """
+    result = classify_prompt(
+        {"messages": [{"role": "user", "content": prompt}]}, config
+    )
+    if result is None:
+        spec = getattr(config, "classifier", None)
+        if spec is None or not getattr(spec, "enabled", False):
+            source = getattr(config, "source", None) or "the config"
+            print(
+                f"{PROG}: the classifier section is disabled in {source}; nothing is "
+                "classified until classifier.enabled is true",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"{PROG}: there is no human prompt to classify", file=sys.stderr)
+        return 1
+    print(format_classify(result))
+    return 0
 
 
 def format_kill_switch(switch: KillSwitch | None) -> str:
@@ -284,6 +377,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "ledger-info":
         return _ledger_info(args.ledger)
 
+    if args.cmd == "cost":
+        return _cost(args)
+
     if args.cmd == "switch-report":
         return _switch_report(args)
 
@@ -292,6 +388,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "status":
         print(format_status(config, read_kill_switch(DecisionLog.from_env().db_path)))
         return 0
+
+    if args.cmd == "classify":
+        return _classify(args.prompt, config)
 
     return _start(config, args.upstream)
 
@@ -375,6 +474,45 @@ def _report(args: argparse.Namespace) -> int:
         return 0
 
     print(as_json(report) if args.as_json else format_report(report))
+    return 0
+
+
+def _cost(args: argparse.Namespace) -> int:
+    """Price the recorded token counts. Read-only; it never creates the database.
+
+    The prices come from the config the router is configured with, but the rows
+    already carry what they cost, so this command never loads `config.yaml` and
+    never re-prices anything. It reports, and it does not write.
+    """
+    if args.last is not None and args.last < 1:
+        print(f"{PROG}: --last must be 1 or more, got {args.last}", file=sys.stderr)
+        return 2
+
+    since = None
+    if args.since is not None:
+        try:
+            since = parse_since(args.since)
+        except ValueError as exc:
+            print(f"{PROG}: --since {exc}", file=sys.stderr)
+            return 2
+
+    filters = ReportFilters(since=since, last=args.last, session=args.session)
+    path = default_db_path()
+    if not path.is_file():
+        print(COST_NOTE)
+        print(f"{NOTHING_PRICED} (no database at {path})")
+        return 0
+
+    try:
+        report = build_cost_report(path, filters)
+    except ReadOnlyError as exc:
+        print(f"{PROG}: {exc}", file=sys.stderr)
+        return 1
+
+    # The note is printed even when there is nothing to price: every number this
+    # command can print is an estimate, and that is true of a report with no rows
+    # in it too.
+    print(cost_as_json(report) if args.as_json else format_cost_report(report))
     return 0
 
 

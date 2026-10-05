@@ -7,6 +7,20 @@ from typing import Any
 from .config import ModelSpec, PolicySpec, RouterConfig
 from .signals import Signals
 
+#: Recorded when the classifier's tier is the tier already in use. A STAY, and
+#: the only outcome the classifier may produce without switching: agreeing with
+#: the request is what Rule 2 asks for by default.
+CLASSIFIER_MATCHES_TIER = "CLASSIFIER_MATCHES_TIER"
+
+#: Recorded when the classifier wants a tier no configured model carries. Rule 7
+#: forbids inventing a model to satisfy it, so the router stays put.
+CLASSIFIER_NO_TARGET = "CLASSIFIER_NO_TARGET"
+
+#: Prefix of the per-tier switch reasons: CLASSIFIER_LOW, CLASSIFIER_MID and
+#: CLASSIFIER_HIGH. Derived from the tier so a new tier cannot produce a code
+#: that says something else.
+CLASSIFIER_REASON_PREFIX = "CLASSIFIER_"
+
 
 @dataclass(frozen=True)
 class Decision:
@@ -96,6 +110,85 @@ def _next_lower(specs: list[ModelSpec], model_id: str) -> ModelSpec | None:
     return best
 
 
+def _first_with_tier(specs: list[ModelSpec], tier: str) -> ModelSpec | None:
+    """The first model in config order whose `cost_tier` is `tier`.
+
+    Config order, not cheapest and not strongest: the config's order is the
+    operator's preference, and the router never re-ranks models itself (Rule 7).
+    """
+    for spec in specs:
+        if spec.cost_tier == tier:
+            return spec
+    return None
+
+
+def classifier_decision(
+    specs: list[ModelSpec],
+    signals: Signals,
+    config: RouterConfig,
+    requested_model: str,
+    requested_effort: str | None,
+) -> Decision | None:
+    """The decision the classifier implies, or None when it does not apply.
+
+    None means "the classifier did not decide", which is what lets the old
+    downgrade rule run exactly as it did before. It is returned when the section
+    is disabled, when no prompt could be classified, and when the config holds
+    no model of the classified tier at all.
+
+    This rule sits between tool-error escalation and the downgrade rule: a model
+    that keeps failing is the stronger evidence, and the old downgrade rule is
+    what the classifier replaces while it is enabled. Agreement is a STAY, so
+    the common case - a prompt that suits the model already in use - changes
+    nothing. Rule 2.
+    """
+    spec = getattr(config, "classifier", None)
+    if spec is None or not getattr(spec, "enabled", False):
+        return None
+    tier = signals.classifier_tier
+    if tier is None:
+        return None
+
+    requested = _find_spec(specs, requested_model)
+    if requested is None:
+        return None
+
+    if requested.cost_tier == tier:
+        return Decision(
+            action="STAY",
+            target_model=requested_model,
+            target_effort=requested_effort,
+            reason_codes=[CLASSIFIER_MATCHES_TIER],
+        )
+
+    target = _first_with_tier(specs, tier)
+    if target is None:
+        # No configured model carries this tier. Inventing one is forbidden, so
+        # the request is passed through unchanged and the reason says why.
+        return Decision(
+            action="STAY",
+            target_model=requested_model,
+            target_effort=requested_effort,
+            reason_codes=[CLASSIFIER_NO_TARGET],
+        )
+
+    if requested_effort is not None and not config.is_legal(target.id, requested_effort):
+        return Decision(
+            action="STAY",
+            target_model=requested_model,
+            target_effort=requested_effort,
+            reason_codes=["ILLEGAL_PAIR"],
+        )
+
+    return Decision(
+        action="SWITCH",
+        target_model=target.id,
+        target_effort=requested_effort,
+        reason_codes=[f"{CLASSIFIER_REASON_PREFIX}{str(tier).upper()}"],
+        direction=_direction_for(specs, requested_model, target.id),
+    )
+
+
 def decide(signals: Signals, requested_model: str, requested_effort: str | None, config: RouterConfig) -> Decision:
     mode = config.mode
     if mode == "off":
@@ -131,6 +224,11 @@ def decide(signals: Signals, requested_model: str, requested_effort: str | None,
         if target_effort is None:
             return Decision(action="SWITCH", target_model=target_model, target_effort=None, reason_codes=["ESCALATE_REPEATED_TOOLS"], direction=_direction_for(specs_list, requested_model, target_model))
         return Decision(action="SWITCH", target_model=target_model, target_effort=target_effort, reason_codes=["ESCALATE_REPEATED_TOOLS"], direction=_direction_for(specs_list, requested_model, target_model))
+    classified = classifier_decision(
+        specs_list, signals, config, requested_model, requested_effort
+    )
+    if classified is not None:
+        return classified
     if policy.downgrade_enabled:
         if (signals.context_tokens_estimate is not None and signals.turn_index is not None and signals.consecutive_tool_errors is not None):
             if (signals.context_tokens_estimate <= policy.downgrade_max_context_tokens and

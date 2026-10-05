@@ -204,7 +204,10 @@ class UsageParser:
             return STATUS_NO_USAGE
         if not self._usable or self._failed:
             return STATUS_UNKNOWN
-        return STATUS_OK if self._saw_counts or self.model_reported else STATUS_UNKNOWN
+        # OK means counts were read. A body that named a model but reported no
+        # counts at all is not OK: pricing it would come out at 0.0, and 0.0 is
+        # a claim that the response was free.
+        return STATUS_OK if self._saw_counts else STATUS_UNKNOWN
 
     def _record(self) -> UsageRecord:
         return UsageRecord(
@@ -292,11 +295,18 @@ class UsageParser:
         self._read_usage(payload.get("usage"))
         self.model_reported = _as_text(payload.get("model"))
 
-    def _read_usage(self, usage: Any) -> None:
-        """Take the four counts from a `usage` object, and nothing else."""
+    def _read_usage(self, usage: Any, include_output: bool = True) -> None:
+        """Take the counts from a `usage` object, and nothing else.
+
+        `include_output` is False for `message_start`, which is not where the
+        final output count lives: on a stream that count arrives with the last
+        `message_delta`, and reading it earlier would price a partial response.
+        """
         if not isinstance(usage, dict):
             return
         self._take("input", _as_int(usage.get("input_tokens")))
+        if include_output:
+            self._take("output", _as_int(usage.get("output_tokens")))
         self._take("cache_read", _as_int(usage.get("cache_read_input_tokens")))
         self._take("cache_write", _as_int(usage.get("cache_creation_input_tokens")))
 
@@ -358,9 +368,9 @@ class UsageParser:
             return
         message = event.get("message")
         if isinstance(message, dict):
-            self._read_usage(message.get("usage"))
+            self._read_usage(message.get("usage"), include_output=False)
             self.model_reported = _as_text(message.get("model"))
-        self._read_usage(event.get("usage"))
+        self._read_usage(event.get("usage"), include_output=False)
 
     def _read_delta(self, payload: bytes) -> None:
         """The last `message_delta` carries the final output count."""

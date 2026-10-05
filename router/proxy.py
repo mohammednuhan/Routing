@@ -50,11 +50,15 @@ from .decisions import (
     DecisionLog,
     DecisionRecord,
     RequestMetadata,
+    UsageRow,
     default_db_path,
     read_request_metadata,
 )
 from .killswitch import REASON_KILL_SWITCH, read_kill_switch
 from .hold import HELD_SIGNAL_KEY, apply_hold
+from .classifier import classify_prompt
+from .cost import estimate_cost
+from .usage import UsageParser, UsageRecord
 from .signals import Signals, compute_signals
 from .policy import decide
 from .safety import COST_SIGNAL_KEY, apply_safety, safety_failure
@@ -127,6 +131,35 @@ REWRITE_FAILED = "rewrite_failed"
 #: Response header naming the hop, added only when a body was actually rewritten
 #: and `routed_header` is enabled.
 ROUTED_HEADER = "X-Tamias-Routed"
+
+#: Error class recorded when classification was attempted and failed. Both
+#: classifier signals stay None, the policy layer runs exactly as it would with
+#: no classifier, and the original bytes are forwarded. Rule 3.
+CLASSIFIER_FAILED = "classifier_failed"
+
+
+def with_classifier(body_json: Any, signals: Signals | None, config: Any) -> Signals | None:
+    """`signals` with the classifier's score and tier filled in.
+
+    Read-only on the parsed body: nothing here writes to it, and the classifier
+    keeps no copy of the prompt it read. `signals` comes back unchanged when the
+    section is disabled or the conversation holds no human prompt, which are
+    ordinary states and not failures.
+    """
+    if signals is None or config is None:
+        return signals
+    task = classify_prompt(body_json, config)
+    if task is None:
+        return signals
+    return replace(signals, classifier_score=task.score, classifier_tier=task.tier)
+
+
+def without_classifier(signals: Signals | None) -> Signals | None:
+    """`signals` with both classifier values cleared, after a failure."""
+    if signals is None:
+        return None
+    return replace(signals, classifier_score=None, classifier_tier=None)
+
 
 _WHITESPACE = " \t\r\n"
 
@@ -403,6 +436,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
     sys_version = ""
     disable_nagle_algorithm = True
 
+    #: The `router_usage` record for the response being relayed, set once the
+    #: response has ended. `None` means "not parsed, or nothing to record".
+    _usage_record: UsageRecord | None = None
+
     def log_message(self, format: str, *args: Any) -> None:
         """Silence the default request/error logging (Rule 5)."""
 
@@ -449,6 +486,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         error_class: str | None = None
         plan: RoutingPlan | None = None
         connection: http.client.HTTPConnection | None = None
+        self._usage_record = None
         try:
             try:
                 body = self._read_request_body()
@@ -497,7 +535,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
         finally:
             if connection is not None:
                 connection.close()
-            self._record_decision(body, status, error_class, plan)
+            decision_id = self._record_decision(body, status, error_class, plan)
+            self._record_usage(decision_id, plan)
             self._log_request(status, started)
 
     @property
@@ -582,13 +621,26 @@ class ProxyHandler(BaseHTTPRequestHandler):
             signal_values: dict[str, Any] = {}
             sig_error: str | None = None
             signals: Signals | None = None
+            parsed: Any = None
             try:
                 parsed = json.loads(body.decode("utf-8"))
                 signals = compute_signals(parsed)
-                signal_values = signals.to_dict()
             except Exception:
-                signal_values = {}
+                parsed = None
+                signals = None
                 sig_error = "signals_failed"
+
+            # Classification reads the same parsed body, in memory, and only
+            # writes two metadata values back. A failure clears both signals and
+            # is counted as an error class; nothing below can forward differently
+            # because of it.
+            try:
+                signals = with_classifier(parsed, signals, self.settings.config)
+            except Exception:
+                signals = without_classifier(signals)
+                sig_error = sig_error or CLASSIFIER_FAILED
+
+            signal_values = signals.to_dict() if signals is not None else {}
 
             action = "STAY"
             chosen_model = metadata.model
@@ -756,13 +808,68 @@ class ProxyHandler(BaseHTTPRequestHandler):
             return (body, REWRITE_FAILED)
         return (rewritten, None)
 
+    def _record_usage(self, decision_id: int | None, plan: RoutingPlan | None) -> None:
+        """Append one `router_usage` row for a POST to /v1/messages.
+
+        Runs after the response has ended and after the decision row exists, so
+        the usage row can link to it. Counts come from the upstream, prices from
+        the config, and neither is ever invented: an unknown figure is written
+        as NULL, which is a different claim from 0.0.
+
+        A failure here is reported as one short line and never affects anything:
+        the response is already complete and the decision row is already
+        written, so the worst a bad usage row can cost is itself.
+        """
+        log = self.settings.decisions
+        if log is None or not self._records_usage:
+            return
+
+        record = self._usage_record
+        if record is None:
+            # The upstream never answered, or the request was rejected before
+            # any body was read: there is no response to have reported usage.
+            record = UsageRecord()
+
+        chosen = plan.chosen_model if plan is not None else None
+        requested = plan.metadata.model if plan is not None else None
+        try:
+            priced = estimate_cost(record, chosen, requested, self.settings.config)
+        except Exception:
+            priced = None
+
+        notes = ",".join(priced.notes) if priced is not None and priced.notes else None
+        cost = priced.cost_usd if priced is not None else None
+        baseline = priced.baseline_cost_usd if priced is not None else None
+
+        try:
+            log.record_usage(
+                UsageRow(
+                    status=record.status,
+                    decision_id=decision_id,
+                    model_reported=record.model_reported,
+                    input_tokens=record.input_tokens,
+                    output_tokens=record.output_tokens,
+                    cache_read_tokens=record.cache_read_tokens,
+                    cache_write_tokens=record.cache_write_tokens,
+                    cost_usd=cost,
+                    baseline_cost_usd=baseline,
+                    notes=notes,
+                )
+            )
+        except Exception as exc:
+            print(
+                f"tamias-router: usage log write failed ({type(exc).__name__})",
+                file=sys.stderr,
+                flush=True,
+            )
+
     def _record_decision(
         self,
         body: bytes,
         status: int,
         error_class: str | None,
         plan: RoutingPlan | None = None,
-    ) -> None:
+    ) -> int | None:
         """Append one metadata-only row for a POST to /v1/messages.
 
         Every other method and path is forwarded and not recorded. A failure
@@ -772,17 +879,20 @@ class ProxyHandler(BaseHTTPRequestHandler):
         `plan` is the decision computed before forwarding. It is recomputed
         only when it is absent, which happens for a request rejected before its
         body was read.
+
+        Returns the new row's `decision_id`, or None when nothing was written,
+        so the usage row can link to it.
         """
         log = self.settings.decisions
         if log is None or self.command != "POST":
-            return
+            return None
         if self.path.split("?", 1)[0] != MESSAGES_PATH:
-            return
+            return None
 
         if plan is None:
             plan = self._plan(body)
             if plan is None:
-                return
+                return None
 
         try:
             signal_values: dict[str, Any] = {}
@@ -810,13 +920,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 applied=plan.applied,
                 error=record_error,
             )
-            log.record(record)
+            return log.record(record)
         except Exception as exc:
             print(
                 f"tamias-router: decision log write failed ({type(exc).__name__})",
                 file=sys.stderr,
                 flush=True,
             )
+            return None
 
     def _release_hold(self, metadata: RequestMetadata) -> None:
         """Drop this session's hold without counting the request.
@@ -1004,6 +1115,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
         if framing == "none":
             return
 
+        # The parser sees a copy of what the client got, never the bytes
+        # themselves: `piece` is relayed above, and only then is a copy handed
+        # over. A parser that is slow, raises or is absent cannot delay or
+        # change what the client receives.
+        parser = self._usage_parser(response)
+
         try:
             while True:
                 piece = response.read1(_READ_CHUNK)
@@ -1014,11 +1131,66 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 else:
                     self.wfile.write(piece)
                 self.wfile.flush()
+                self._feed_usage(parser, piece)
             if framing == "chunked":
                 self.wfile.write(b"0\r\n\r\n")
                 self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
             self.close_connection = True
+
+        self._finish_usage(parser)
+
+    def _usage_parser(self, response: http.client.HTTPResponse) -> UsageParser | None:
+        """A parser for this response, or None when nothing is worth parsing.
+
+        Only a `POST /v1/messages` response is priced, so every other request
+        gets no parser at all and pays nothing for the feature. Construction can
+        raise on an odd header, so a failure here means "no row", never a
+        changed response.
+        """
+        if not self._records_usage:
+            return None
+        try:
+            return UsageParser(
+                response.status,
+                content_encoding=response.getheader("Content-Encoding") or "",
+                content_type=response.getheader("Content-Type") or "",
+            )
+        except Exception:
+            return None
+
+    def _feed_usage(self, parser: UsageParser | None, piece: bytes) -> None:
+        """Hand the parser a copy of one chunk, and ignore anything it does.
+
+        Every failure is swallowed. The bytes are already on the wire by this
+        point, so a parser that cannot cope costs one row, never a response
+        (Rule 3).
+        """
+        if parser is None:
+            return
+        try:
+            parser.feed(bytes(piece))
+        except Exception:
+            pass
+
+    def _finish_usage(self, parser: UsageParser | None) -> None:
+        """Read the final record and queue it for writing after the response.
+
+        The row is written by `_record_usage`, once the response has ended and
+        the decision row exists to link to.
+        """
+        if parser is None:
+            return
+        try:
+            record = parser.finish()
+        except Exception:
+            record = UsageRecord()
+        self._usage_record = record
+
+    @property
+    def _records_usage(self) -> bool:
+        """True only for a POST to /v1/messages: the one response that is priced."""
+        return self.command == "POST" and self.path.split("?", 1)[0] == MESSAGES_PATH
 
     def _reply_json(self, status: int, code: str, message: str) -> None:
         """A short JSON error. Carries no header, body or credential material."""

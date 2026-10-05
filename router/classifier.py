@@ -190,7 +190,11 @@ def _count_keywords(keywords: Any, lowered_text: str) -> int:
     """How many distinct keywords appear in the text.
 
     A keyword matches when its characters appear anywhere in the prompt,
-    ignoring case. An empty keyword is ignored: it would match everything.
+    ignoring case. Only the count is returned: which keywords matched is text
+    from the prompt, and `reason_codes` must never carry it. Rule 1.
+
+    A repeated keyword counts once, and an empty one is ignored: it would match
+    every prompt and make the count meaningless.
     """
     if not isinstance(keywords, (list, tuple)):
         return 0
@@ -199,19 +203,8 @@ def _count_keywords(keywords: Any, lowered_text: str) -> int:
         if not isinstance(keyword, str):
             continue
         folded = keyword.casefold().strip()
-        if not folded or folded in seen:
-            continue
-        seen.add(folded)
-        if folded in lowered_text:
-            yield_hits = True  # noqa: F841
-    return sum(
-        1
-        for folded in seen
-        if folded in lowered_text
-    ) if False else _hits(seen, lowered_text)
-
-
-def _hits(seen: set[str], lowered_text: str) -> int:
+        if folded:
+            seen.add(folded)
     return sum(1 for folded in seen if folded in lowered_text)
 
 

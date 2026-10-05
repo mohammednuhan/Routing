@@ -142,3 +142,81 @@ policy:
   # requests, by a request naming another model, or by the kill switch, an open
   # circuit or mode `off`.
   hold_max_requests: 50
+
+# Rule-based task classification from the latest human prompt.
+#
+# DISABLED by default, and it must stay that way on a fresh install: while
+# `enabled` is false the prompt is not read at all, no classifier signal is set
+# and no decision changes anywhere. Turning it on is a deliberate act.
+#
+# When enabled, the LATEST human prompt - the last message with role `user`
+# that carries text - is read in memory for the length of one call and dropped
+# again. It is never stored, never logged, never put in an exception message and
+# never returned. Only a score, a tier and reason codes come out of it.
+#
+# The reason codes carry COUNTS, never the word that matched: STRONG_KW:2 says
+# two strong keywords appeared, not which ones, because a matched word is
+# prompt text. Rule 1.
+#
+# The tier names (`low`, `mid`, `high`) are the same `cost_tier` labels the
+# models above carry, so a classified tier always names a tier a configured
+# model can already have. Rule 7.
+#
+# Tune these with `tamias-router classify "<prompt>"`, which is a dry run: it
+# scores a prompt typed on the command line and writes nothing anywhere.
+classifier:
+  enabled: false
+
+  # Each distinct keyword found adds `points.strong`, up to `points.strong_cap`
+  # in total. Matching ignores case. Edit these freely; they are the tuning
+  # surface, and they are ordinary words, not prompt content.
+  strong_keywords:
+    - refactor
+    - debug
+    - architecture
+    - optimize
+    - implement
+    - migration
+    - concurrency
+    - regression
+
+  # Each distinct keyword found subtracts `points.cheap`, down to no less than
+  # `points.cheap_cap` in total. Cheap-sounding work is not proof of cheap work;
+  # it is one transparent hint among several, and the thresholds below are what
+  # finally decide the tier.
+  cheap_keywords:
+    - typo
+    - rename
+    - spell
+    - wording
+    - comment
+    - lint
+    - hello
+
+  # Rule weights. Every one is a plain integer, not a measurement.
+  points:
+    # Score a prompt starts from before any rule is applied.
+    base: 50
+    # Added per distinct strong keyword, never more than strong_cap in total.
+    strong: 25
+    strong_cap: 50
+    # Subtracted per distinct cheap keyword, never more than cheap_cap in total.
+    cheap: -20
+    cheap_cap: -40
+    # A prompt longer than long_chars adds long_points. Longer than
+    # very_long_chars it adds very_long_points as well, so a very long prompt
+    # collects both reasons rather than one replacing the other.
+    long_chars: 200
+    long_points: 10
+    very_long_chars: 600
+    very_long_points: 20
+    # Three or more file-like tokens adds many_files_points.
+    many_files: 3
+    many_files_points: 15
+    # A prompt that is nothing but a single question loses question_points.
+    question_points: -10
+
+  # The score is clamped to 0..100. Below cheap_below the tier is `low`, from
+  # strong_from upwards it is `high`, and everything between the two is `mid`.
+  cheap_below: 35
+  strong_from: 65

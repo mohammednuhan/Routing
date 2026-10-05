@@ -13,7 +13,14 @@ from typing import Any
 
 @dataclass(frozen=True)
 class Signals:
-    """Computed difficulty signals. Metadata only."""
+    """Computed difficulty signals. Metadata only.
+
+    `classifier_score` and `classifier_tier` are filled by the proxy from
+    `router/classifier.py`, not by `compute_signals`, because only the proxy
+    holds the parsed body and the config. Both stay None when the classifier
+    section is disabled, when there is no human prompt to classify, and when
+    classification failed: an undeterminable value is never guessed.
+    """
 
     context_tokens_estimate: int | None = None
     message_count: int | None = None
@@ -26,6 +33,8 @@ class Signals:
     requested_effort_if_present: str | None = None
     tool_use_pending: bool | None = None
     in_tool_loop: bool | None = None
+    classifier_score: int | None = None
+    classifier_tier: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

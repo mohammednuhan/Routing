@@ -873,13 +873,17 @@ def test_mock_upstream_reports_the_model_it_received():
 
 
 def test_mock_upstream_survives_a_body_that_is_not_json():
+    """Answered 200, byte count intact, and nothing parsed out of the body."""
     with running_mock_upstream() as port:
         status, _, payload = post_once(port, b"not json")
 
         assert status == 200
-        assert json.loads(payload) == {
-            "ok": True,
-            "received_bytes": 8,
-            "content_length": "8",
-            "json": False,
-        }
+        report = json.loads(payload)
+        assert report["ok"] is True
+        assert report["received_bytes"] == 8
+        assert report["content_length"] == "8"
+        assert report["json"] is False
+        # Anything only a parsed body could produce must be absent: the mock
+        # upstream must not have guessed a model, an effort, framing or a count.
+        for absent in ("model", "effort", "stream", "messages"):
+            assert absent not in report, f"reported {absent} from a body it could not parse"

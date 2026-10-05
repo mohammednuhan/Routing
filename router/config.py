@@ -82,6 +82,43 @@ DEFAULT_CLASSIFIER_CHEAP_BELOW = 35
 #: models carry, so a classified tier names a tier a model can already have.
 LEGAL_CLASSIFIER_TIERS: tuple[str, ...] = ("low", "mid", "high")
 
+#: Keys the optional `classifier` section accepts. Anything else is rejected, so
+#: a misspelled key cannot silently disable a rule somebody believes is running.
+_CLASSIFIER_KEYS: frozenset[str] = frozenset(
+    {
+        "enabled",
+        "strong_keywords",
+        "cheap_keywords",
+        "points",
+        "cheap_below",
+        "strong_from",
+    }
+)
+
+#: Keys the `classifier.points` block accepts. Each is optional and falls back to
+#: the `DEFAULT_CLASSIFIER_*` constant of the same name.
+_CLASSIFIER_POINT_KEYS: tuple[str, ...] = (
+    "base",
+    "strong",
+    "strong_cap",
+    "cheap",
+    "cheap_cap",
+    "long_chars",
+    "long_points",
+    "very_long_chars",
+    "very_long_points",
+    "many_files",
+    "many_files_points",
+    "question_points",
+)
+
+#: A score is clamped to this range by `router/classifier.py`, so a tier
+#: boundary outside it could never be reached. Declared here too, because the
+#: boundaries are validated at load time and config must not import the module
+#: that reads it.
+MIN_CLASSIFIER_SCORE = 0
+MAX_CLASSIFIER_SCORE = 100
+
 
 class ConfigError(Exception):
     """The config file is missing, unreadable, malformed, or illegal."""
@@ -246,6 +283,7 @@ def load_config(path: Path | None = None) -> RouterConfig:
     routed_header = _parse_flag(data, "routed_header", where)
 
     policy = _parse_policy(data, where)
+    classifier = _parse_classifier(data, where)
 
     by_id = {spec.id: spec for spec in models}
     if default_model not in by_id:
@@ -269,6 +307,7 @@ def load_config(path: Path | None = None) -> RouterConfig:
         default_model=default_model,
         default_effort=default_effort,
         policy=policy,
+        classifier=classifier,
         routed_header=routed_header,
         source=source,
     )
@@ -485,4 +524,126 @@ def _parse_policy(data: dict[str, Any], where: str) -> PolicySpec | None:
         hold_max_requests=pos_int_or(
             "hold_max_requests", DEFAULT_HOLD_MAX_REQUESTS
         ),
+    )
+
+
+def _parse_classifier(data: dict[str, Any], where: str) -> ClassifierSpec | None:
+    """The optional `classifier` section, or None when there is not one.
+
+    Absent means disabled, never enabled: `ClassifierSpec.enabled` defaults to
+    False and nothing here can turn it on without the file saying so. While the
+    section is disabled `router/classifier.py` returns None for every prompt, no
+    signal is set and no decision changes. Rule 2.
+
+    Every key is validated rather than coerced. A rule weight nobody verified is
+    worse than no rule at all, so a wrong type is an error and never a default.
+    """
+    if "classifier" not in data:
+        return None
+    section = data["classifier"]
+    if section is None:
+        return None
+    if not isinstance(section, dict):
+        raise ConfigError(f"{where} key 'classifier' must be a mapping")
+
+    for key in section:
+        if key not in _CLASSIFIER_KEYS:
+            raise ConfigError(f"unknown classifier key {key!r}")
+
+    enabled = section.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ConfigError(f"classifier 'enabled' must be boolean, got {enabled!r}")
+
+    cheap_below = _classifier_int(
+        section, "cheap_below", DEFAULT_CLASSIFIER_CHEAP_BELOW, MIN_CLASSIFIER_SCORE, MAX_CLASSIFIER_SCORE
+    )
+    strong_from = _classifier_int(
+        section, "strong_from", DEFAULT_CLASSIFIER_STRONG_FROM, MIN_CLASSIFIER_SCORE, MAX_CLASSIFIER_SCORE
+    )
+    if cheap_below > strong_from:
+        raise ConfigError(
+            f"classifier 'cheap_below' ({cheap_below}) must not exceed "
+            f"'strong_from' ({strong_from}): the tier boundaries would overlap"
+        )
+
+    return ClassifierSpec(
+        enabled=enabled,
+        strong_keywords=_keyword_list(section, "strong_keywords"),
+        cheap_keywords=_keyword_list(section, "cheap_keywords"),
+        points=_parse_classifier_points(section.get("points"), where),
+        cheap_below=cheap_below,
+        strong_from=strong_from,
+    )
+
+
+def _keyword_list(section: dict[str, Any], key: str) -> tuple[str, ...]:
+    """A keyword list, or empty when the key is absent.
+
+    An empty keyword is rejected rather than ignored: it would match every
+    prompt, and a rule that always fires is not a rule anybody tuned.
+    """
+    raw = section.get(key)
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise ConfigError(f"classifier {key!r} must be a list of strings, got {raw!r}")
+    words: list[str] = []
+    for position, item in enumerate(raw):
+        if not isinstance(item, str) or not item.strip():
+            raise ConfigError(
+                f"classifier {key}[{position}] must be a non-empty string, got {item!r}"
+            )
+        words.append(item)
+    return tuple(words)
+
+
+def _classifier_int(
+    section: dict[str, Any], key: str, default: int, least: int, most: int
+) -> int:
+    """An integer inside a range, or the shipped default when the key is absent."""
+    if key not in section:
+        return default
+    value = section[key]
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ConfigError(f"classifier {key!r} must be an integer, got {value!r}")
+    if not least <= value <= most:
+        raise ConfigError(
+            f"classifier {key!r} must be in {least}..{most}, got {value}"
+        )
+    return value
+
+
+def _parse_classifier_points(raw: Any, where: str) -> ClassifierPoints:
+    """The rule weights, or the shipped defaults when the block is absent."""
+    if raw is None:
+        return ClassifierPoints()
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{where} key 'classifier' -> 'points' must be a mapping")
+    for key in raw:
+        if key not in _CLASSIFIER_POINT_KEYS:
+            raise ConfigError(f"unknown classifier points key {key!r}")
+
+    def weight(key: str, default: int) -> int:
+        if key not in raw:
+            return default
+        value = raw[key]
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ConfigError(
+                f"classifier points {key!r} must be an integer, got {value!r}"
+            )
+        return value
+
+    return ClassifierPoints(
+        base=weight("base", DEFAULT_CLASSIFIER_BASE),
+        strong=weight("strong", DEFAULT_CLASSIFIER_STRONG),
+        strong_cap=weight("strong_cap", DEFAULT_CLASSIFIER_STRONG_CAP),
+        cheap=weight("cheap", DEFAULT_CLASSIFIER_CHEAP),
+        cheap_cap=weight("cheap_cap", DEFAULT_CLASSIFIER_CHEAP_CAP),
+        long_chars=weight("long_chars", DEFAULT_CLASSIFIER_LONG_CHARS),
+        long_points=weight("long_points", DEFAULT_CLASSIFIER_LONG_POINTS),
+        very_long_chars=weight("very_long_chars", DEFAULT_CLASSIFIER_VERY_LONG_CHARS),
+        very_long_points=weight("very_long_points", DEFAULT_CLASSIFIER_VERY_LONG_POINTS),
+        many_files=weight("many_files", DEFAULT_CLASSIFIER_MANY_FILES),
+        many_files_points=weight("many_files_points", DEFAULT_CLASSIFIER_MANY_FILES_POINTS),
+        question_points=weight("question_points", DEFAULT_CLASSIFIER_QUESTION_POINTS),
     )

@@ -65,11 +65,13 @@ def test_it_lists_every_table_with_its_columns(tmp_path, capsys):
     assert err == ""
     assert out.splitlines()[0] == LEDGER_NOTE
     assert f"ledger: {path}" in out
-    assert "tables: 2" in out
+    assert "tables: 3" in out
     assert "\nobserver_events\n" in out
     assert "\nrouter_decisions\n" in out
+    assert "\nrouter_usage\n" in out
     assert re.search(r"^observer_events\n  rows\s+2$", out, re.MULTILINE)
     assert re.search(r"^router_decisions\n  rows\s+1$", out, re.MULTILINE)
+    assert re.search(r"^router_usage\n  rows\s+0$", out, re.MULTILINE)
 
 
 def test_it_prints_column_names_and_declared_types(tmp_path, capsys):
@@ -115,8 +117,18 @@ def test_it_does_not_describe_what_a_column_means(tmp_path, capsys):
 
     assert code == 0
     lowered = out.lower()
-    for word in ("probably", "likely", "seems", "appears to", "usd", "$", "cost"):
+    # Words that can never be part of this schema, so their absence still
+    # means the command added nothing of its own.
+    for word in ("probably", "likely", "seems", "appears to", "$"):
         assert word not in lowered
+    # "usd" and "cost" used to be banned outright. They no longer can be:
+    # `router_usage` has columns literally named `cost_usd` and
+    # `baseline_cost_usd`, so banning the words would ban the schema itself.
+    # What must not happen is the command using them as a unit or a label, so
+    # any line carrying one has to be a bare `name  TYPE` column entry.
+    for line in out.splitlines():
+        if "usd" in line.lower() or "cost" in line.lower():
+            assert re.fullmatch(r"    \w+ +[A-Z]+", line), line
 
 
 def test_a_missing_file_is_reported_and_exits_non_zero(tmp_path, capsys):

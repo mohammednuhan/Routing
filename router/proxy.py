@@ -9,9 +9,15 @@ body unchanged. It makes no routing decision and changes no model. The bytes it
 forwards are never altered, not even to read metadata out of them: a request
 body is parsed read-only, after the original bytes have already been sent.
 
-For `POST /v1/messages` it appends one row to the decision log: requested and
-chosen model, effort, mode, reason codes and an error class. Metadata only - see
-`router/decisions.py` and Rule 1.
+For a `POST` to a request path it recognises, it appends one row to the decision
+log: requested and chosen model, effort, mode, reason codes and an error class.
+Metadata only - see `router/decisions.py` and Rule 1. Two request formats are
+recognised, decided by the path and nothing else: a path ending in
+`/v1/messages` is Anthropic Messages format, and one ending in
+`/chat/completions` is OpenAI chat-completions format. Both are read, decided
+on and logged by the same pipeline; `signal_values` carries the format under
+`api_format` so a row says which one it was. Any other path is forwarded and
+recorded nowhere, exactly as before.
 
 Streaming responses are relayed chunk by chunk as they arrive and flushed after
 each chunk; the whole response is never buffered.
@@ -60,12 +66,30 @@ from .classifier import classify_prompt
 from .cost import estimate_cost
 from .usage import UsageParser, UsageRecord
 from .signals import Signals, compute_signals
+from .signals_openai import compute_signals_openai
 from .policy import decide
 from .safety import COST_SIGNAL_KEY, apply_safety, safety_failure
 from .state import SessionStore
 
 #: The only host this proxy will bind. Rule 4.
 LOOPBACK_HOST = "127.0.0.1"
+
+#: The request formats the router knows how to read. Anything else is forwarded
+#: and recorded nowhere, so an unknown route can never acquire a decision.
+API_FORMAT_ANTHROPIC = "anthropic"
+API_FORMAT_OPENAI = "openai"
+
+#: Path suffixes that name a format. Matched as a suffix on the path with the
+#: query string removed, so a gateway that prefixes its routes
+#: (`/anthropic/v1/messages`, `/openai/v1/chat/completions`) still names the
+#: format it is serving. The Anthropic suffix is the one
+#: `router/decisions.py` has always logged.
+ANTHROPIC_PATH_SUFFIX = MESSAGES_PATH
+OPENAI_PATH_SUFFIX = "/chat/completions"
+
+#: Key the format is recorded under in `signal_values`. A constant the tests and
+#: the reports read it by, so the name is written down once.
+API_FORMAT_SIGNAL_KEY = "api_format"
 
 #: Seconds allowed for the upstream connection and for each read from it.
 DEFAULT_UPSTREAM_TIMEOUT = 60.0
@@ -102,6 +126,24 @@ _METHODS_EXPECTING_BODY = frozenset({"POST", "PUT", "PATCH"})
 _BODYLESS_STATUSES = frozenset({204, 304})
 
 _DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def detect_api_format(path: str) -> str | None:
+    """The format `path` names, or None when it names no format at all.
+
+    The query string is dropped first: `?beta=true` says nothing about which API
+    a route belongs to, and a query the client controls must never be able to
+    change what the router believes it is looking at.
+
+    The only caller that reads a request body picks its signal reader from this,
+    so an unrecognised path is the only way to guarantee no decision is made.
+    """
+    route = path.split("?", 1)[0]
+    if route.endswith(ANTHROPIC_PATH_SUFFIX):
+        return API_FORMAT_ANTHROPIC
+    if route.endswith(OPENAI_PATH_SUFFIX):
+        return API_FORMAT_OPENAI
+    return None
 
 
 def _is_legal_target(config: Any, model: str) -> bool:
@@ -402,6 +444,7 @@ class RoutingPlan:
     """
 
     metadata: RequestMetadata
+    api_format: str
     signals: Signals | None
     sig_error: str | None
     session_hint: str | None
@@ -545,7 +588,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         log = self.settings.decisions
         return log.db_path if log is not None else default_db_path()
 
-    def _passthrough_plan(self, body: bytes, reason: str) -> RoutingPlan:
+    def _passthrough_plan(self, body: bytes, reason: str, api_format: str) -> RoutingPlan:
         """The plan for a request the router is not allowed to change.
 
         Used by the kill switch and by an open circuit. The bytes are the ones
@@ -562,6 +605,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         self._release_hold(metadata)
         return RoutingPlan(
             metadata=metadata,
+            api_format=api_format,
             signals=None,
             sig_error=None,
             session_hint=None,
@@ -600,7 +644,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
         """
         if self.command != "POST":
             return None
-        if self.path.split("?", 1)[0] != MESSAGES_PATH:
+        api_format = detect_api_format(self.path)
+        if api_format is None:
             return None
 
         # The kill switch and the breaker are checked here, per request, so
@@ -608,23 +653,30 @@ class ProxyHandler(BaseHTTPRequestHandler):
         # forgets to look. Both pass the request straight through.
         switch = read_kill_switch(self._db_path)
         if switch.on:
-            return self._passthrough_plan(body, REASON_KILL_SWITCH)
+            return self._passthrough_plan(body, REASON_KILL_SWITCH, api_format)
 
         breaker = self.settings.breaker
         if breaker is not None and breaker.is_open():
-            return self._passthrough_plan(body, REASON_CIRCUIT_OPEN)
+            return self._passthrough_plan(body, REASON_CIRCUIT_OPEN, api_format)
 
         mode = self._effective_mode
         try:
             metadata = read_request_metadata(body)
 
-            signal_values: dict[str, Any] = {}
+            signal_values: dict[str, Any] = {API_FORMAT_SIGNAL_KEY: api_format}
             sig_error: str | None = None
             signals: Signals | None = None
             parsed: Any = None
             try:
                 parsed = json.loads(body.decode("utf-8"))
-                signals = compute_signals(parsed)
+                # The path named the format, so the format decides how the body
+                # is read. Both readers return the same dataclass, and nothing
+                # below this line knows which one ran.
+                signals = (
+                    compute_signals_openai(parsed)
+                    if api_format == API_FORMAT_OPENAI
+                    else compute_signals(parsed)
+                )
             except Exception:
                 parsed = None
                 signals = None
@@ -748,6 +800,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
             return RoutingPlan(
                 metadata=metadata,
+                api_format=api_format,
                 signals=signals,
                 sig_error=sig_error,
                 session_hint=session_hint,
@@ -767,6 +820,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             # Nothing above may prevent the request from being forwarded.
             return RoutingPlan(
                 metadata=RequestMetadata(error="router_plan_failed"),
+                api_format=api_format,
                 signals=None,
                 sig_error=None,
                 session_hint=None,
@@ -870,11 +924,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
         error_class: str | None,
         plan: RoutingPlan | None = None,
     ) -> int | None:
-        """Append one metadata-only row for a POST to /v1/messages.
+        """Append one metadata-only row for a POST the router recognises.
 
-        Every other method and path is forwarded and not recorded. A failure
-        here is reported as one short line and never affects the request, which
-        has already been forwarded by the time this runs.
+        Both recognised routes, Anthropic and OpenAI, get one row each, and the
+        format is recorded in `signal_values` so a row can be read back without
+        guessing which body produced it. Every other method and path is
+        forwarded and not recorded. A failure here is reported as one short line
+        and never affects the request, which has already been forwarded by the
+        time this runs.
 
         `plan` is the decision computed before forwarding. It is recomputed
         only when it is absent, which happens for a request rejected before its
@@ -886,7 +943,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         log = self.settings.decisions
         if log is None or self.command != "POST":
             return None
-        if self.path.split("?", 1)[0] != MESSAGES_PATH:
+        if detect_api_format(self.path) is None:
             return None
 
         if plan is None:
@@ -895,9 +952,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 return None
 
         try:
-            signal_values: dict[str, Any] = {}
+            signal_values: dict[str, Any] = {API_FORMAT_SIGNAL_KEY: plan.api_format}
             if plan.signals is not None:
-                signal_values = plan.signals.to_dict()
+                signal_values.update(plan.signals.to_dict())
             if plan.estimated_cost is not None:
                 signal_values[COST_SIGNAL_KEY] = plan.estimated_cost
             if plan.held_requests is not None:
@@ -1189,7 +1246,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
     @property
     def _records_usage(self) -> bool:
-        """True only for a POST to /v1/messages: the one response that is priced."""
+        """True only for a `POST /v1/messages`: the one response that is priced.
+
+        Deliberately still Anthropic-only. Pricing an OpenAI-format response is
+        a separate change, with its own counts and its own table semantics, and
+        an unpriced format must record no usage row at all rather than a
+        half-filled one.
+        """
         return self.command == "POST" and self.path.split("?", 1)[0] == MESSAGES_PATH
 
     def _reply_json(self, status: int, code: str, message: str) -> None:

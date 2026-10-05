@@ -9,6 +9,9 @@ Standard library only. Routes:
                         or, when the request asked to stream, an SSE sequence
                         of 3 chunks (message_start, content_block_delta,
                         message_delta) carrying usage too
+    POST /v1/chat/completions
+                     -> the same report, with the effort read from
+                        "reasoning_effort" or "reasoning.effort"
     GET  /static       -> a fixed non-streaming body
     GET  /stream       -> 3 SSE chunks, one per second, chunked
     GET  /status/<n>   -> HTTP <n> with a small body
@@ -18,6 +21,11 @@ The usage counts are fixed, invented numbers, and `TEST_PHRASE` is a phrase no
 test should ever find in the router's database or logs. It exists in the
 `content_block_delta` event of the streaming response precisely so the tests can
 prove the phrase in an assistant response never gets stored.
+
+The chat-completions route answers with a report even when the request asked to
+stream: this tool fakes the Anthropic SSE sequence and nothing else. A manual
+test of an OpenAI stream should expect that difference, and the tests use the
+non-streaming form.
 
 Run it, then point the proxy at it:
 
@@ -126,6 +134,23 @@ def _effort_of(payload: dict[str, object]) -> object:
     return None
 
 
+def _openai_effort_of(payload: dict[str, object]) -> object:
+    """The effort a chat-completions request asked for, as that API expresses it.
+
+    `reasoning_effort` may be a plain field or, for the providers that nest it,
+    the `effort` of a `reasoning` object. Mirrors what
+    `router/signals_openai.py` reads, so the report says the same effort the
+    router would have seen. Anything unexpected yields None rather than a guess.
+    """
+    direct = payload.get("reasoning_effort")
+    if direct is not None:
+        return direct
+    reasoning = payload.get("reasoning")
+    if isinstance(reasoning, dict):
+        return reasoning.get("effort")
+    return None
+
+
 class MockUpstreamHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "mock-upstream"
@@ -186,7 +211,42 @@ class MockUpstreamHandler(BaseHTTPRequestHandler):
         if self.route == "/v1/messages":
             self._messages(body)
             return
+        if self.route == "/v1/chat/completions":
+            self._chat_completions(body)
+            return
         self._send(404, b"mock upstream: no such route\n", "text/plain")
+
+    def _chat_completions(self, body: bytes) -> None:
+        """Report what a `/v1/chat/completions` request carried, as JSON.
+
+        The same metadata report as `/v1/messages`, and for the same reason: the
+        message list is never returned, only how many messages arrived, so this
+        tool cannot become a place where request content is stored. Streaming is
+        not faked here - see the module docstring.
+        """
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except ValueError:
+            payload = None
+
+        report: dict[str, object] = {
+            "ok": True,
+            "received_bytes": len(body),
+            "content_length": self.headers.get("Content-Length"),
+        }
+        if isinstance(payload, dict):
+            report["model"] = payload.get("model")
+            report["effort"] = _openai_effort_of(payload)
+            report["stream"] = payload.get("stream")
+            report["messages"] = len(payload.get("messages") or [])
+            report["usage"] = {
+                "prompt_tokens": MOCK_INPUT_TOKENS,
+                "completion_tokens": MOCK_OUTPUT_TOKENS,
+            }
+        else:
+            report["json"] = False
+
+        self._send(200, json.dumps(report).encode(), "application/json")
 
     def _messages(self, body: bytes) -> None:
         """Report what a `/v1/messages` request carried, as JSON.

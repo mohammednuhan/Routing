@@ -81,9 +81,14 @@ def latest_prompt_text(body_json: Any) -> str | None:
     """The latest human prompt in the body, or None. Held in memory only.
 
     The last message with role `user` that carries text: a string body, or a
-    `text` block. A message made only of `tool_result` blocks carries no human
-    text and is skipped, so the prompt being classified during a tool loop is
-    the human message that started it and not the tool output that followed.
+    `text` block. Only `user` counts, in either request format the router
+    accepts: an Anthropic `tool_result` block and an OpenAI `tool` or
+    `assistant` message are both skipped, so the prompt being classified
+    during a tool loop is the human message that started it and not the tool
+    output or model text that followed.
+
+    A message made only of `tool_result` blocks carries no human text and is
+    skipped for the same reason.
 
     Callers must not store, log or return the result. `classify_prompt` is the
     only intended caller, and it keeps nothing.
@@ -103,7 +108,13 @@ def latest_prompt_text(body_json: Any) -> str | None:
 
 
 def _content_text(content: Any) -> str | None:
-    """The text of one message: a string body, or its `text` blocks."""
+    """The text of one message: a string body, or its `text` blocks.
+
+    A block is read when its `type` is `text` and its `text` is a string, which
+    is how both accepted formats express a text part. Any other shape gives
+    None rather than raising, because a malformed part must never become an
+    exception on the request path.
+    """
     if isinstance(content, str):
         return content
     if isinstance(content, list):

@@ -8,10 +8,13 @@ the life of the process.
 `held_model` is the model an allowed switch picked, kept so that the requests
 which follow it - which arrive naming the ORIGINAL model, because the client
 never learns it was moved - can stay on it. `held_from_model` is the model the
-client is still asking for, and `held_requests` counts the requests the hold
-has served. All three are a model id, a model id and a counter. Rule 1 applies
-to them exactly as it applies to the rest: there is no field here for a
-message, a prompt, tool arguments or a header, and none may be added.
+client is still asking for, `held_requests` counts the requests the hold has
+served, and `held_prompt_count` is how many human prompts the held request's
+conversation carried, so a later request can tell the continuation of that one
+prompt from a new one. All four are a model id, a model id, a counter and a
+count. Rule 1 applies to them exactly as it applies to the rest: there is no
+field here for a message, a prompt, tool arguments or a header, and none may
+be added.
 
 It is deliberately NOT persisted. A restart forgets every session, which can
 only make the router more willing to switch, never less; the safety layer fails
@@ -52,6 +55,7 @@ class SessionState:
     held_model: str | None = None
     held_from_model: str | None = None
     held_requests: int = 0
+    held_prompt_count: int | None = None
 
     @property
     def requests_since_last_switch(self) -> int | None:
@@ -74,7 +78,9 @@ class SessionState:
             switch_count=self.switch_count + 1,
         )
 
-    def recorded_hold(self, target_model: str, from_model: str) -> SessionState:
+    def recorded_hold(
+        self, target_model: str, from_model: str, prompt_count: int | None = None
+    ) -> SessionState:
         """A copy that holds `target_model` on behalf of a switch from `from_model`.
 
         Recorded next to an allowed switch, and nowhere else: a hold is the
@@ -82,17 +88,30 @@ class SessionState:
         never touches `switch_count`, `last_switch_request_index` or
         `last_switch_direction`, because serving the hold is not a new switch
         and must not look like one to dwell or to the per-session cap.
+
+        `prompt_count` is the request's `human_prompt_count`, stored so a later
+        request can tell a tool-loop continuation of the same human prompt from
+        a new one. It is a count, or None when that request's count could not
+        be determined. A later request whose own count is known to be higher
+        releases the hold rather than being served from it.
         """
         return replace(
             self,
             held_model=target_model,
             held_from_model=from_model,
             held_requests=0,
+            held_prompt_count=prompt_count,
         )
 
     def released_hold(self) -> SessionState:
-        """A copy with no hold. The counter goes with it."""
-        return replace(self, held_model=None, held_from_model=None, held_requests=0)
+        """A copy with no hold. The counters go with it."""
+        return replace(
+            self,
+            held_model=None,
+            held_from_model=None,
+            held_requests=0,
+            held_prompt_count=None,
+        )
 
     @property
     def has_hold(self) -> bool:

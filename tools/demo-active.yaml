@@ -225,10 +225,13 @@ policy:
   # Safety layer. These can only BLOCK a switch; none of them can cause one.
   # A blocked switch is recorded as STAY with applied=0 and a BLOCKED_* reason.
   #
+  # DEMO SETTINGS: low values so the model follows each new task
   # Minimum requests between allowed switches within one session.
-  dwell_requests: 5
+  dwell_requests: 1
   # A reversal must be proposed this many requests in a row before it is allowed.
-  hysteresis_requests: 3
+  hysteresis_requests: 1
+  # Switches one session may make before the cap blocks the next one.
+  max_switches_per_session: 50
   # Extra headroom, in USD, required on top of the estimated rebuild cost.
   safety_margin_usd: 0.0
   # Estimated benefit of an escalation, USD. DUMMY VALUES, NOT REAL PRICES.
@@ -264,6 +267,12 @@ classifier:
     - migration
     - concurrency
     - regression
+    - create
+    - build
+    - frontend
+    - website
+    - develop
+    - design
 
   # Each distinct keyword found subtracts `points.cheap`, down to no less than
   # `points.cheap_cap` in total.

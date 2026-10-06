@@ -1516,8 +1516,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
         recorded as an error class, never dropped and never applied.
 
         The hold runs afterwards, on safety's final answer, so it can only
-        replace a STAY. Nothing is stored and no hold moves when safety failed:
-        a layer that could not check the request does not get to act on it.
+        replace a STAY. It is given this request's `human_prompt_count`, so a
+        hold recorded for one human prompt is released rather than served when
+        the request in front of it carries a new one. Nothing is stored and no
+        hold moves when safety failed: a layer that could not check the request
+        does not get to act on it.
         """
         try:
             current = store.observe(session_hint)
@@ -1529,6 +1532,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 updated,
                 config,
                 mode,
+                signals.human_prompt_count,
             )
             store.replace(session_hint, updated)
             return (final, False, updated)

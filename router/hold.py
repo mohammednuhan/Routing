@@ -11,6 +11,11 @@ came FROM is answered with the held model instead, under the reason
 `HELD_MODEL`. The session stays where the router put it until the hold is
 released.
 
+The hold protects ONE human prompt - the tool loop that prompt opens - and not
+the session's later prompts. A new human prompt is a new task, so it releases
+the hold and is decided by the policy like any other request; see the release
+list below.
+
 A hold is not a new switch, and it is deliberately not treated as one:
 
 * it does not pass the dwell, hysteresis or cost checks, because the first
@@ -28,6 +33,14 @@ Release happens when the hold stops describing reality:
 
 * the policy proposes a switch of its own that safety approves - the new switch
   replaces the old hold;
+* the request carries a NEW human prompt, meaning its `human_prompt_count` is
+  higher than the one the hold was recorded with. The hold was the memory of
+  one human prompt's tool loop; a later prompt is a different task, and the
+  policy's own answer for it is what must stand. The release runs before the
+  hold could be served, so no such request is ever answered with
+  `HELD_MODEL`. A request whose count, or whose held count, is None cannot
+  say whether it is new, and then the hold behaves as it always did - but a
+  hold is never kept across a request whose count is known to be higher;
 * the hold has served `hold_max_requests` requests, so it cannot outlive the
   conditions that justified it;
 * the client asks for a different model, so the hold was about a model this
@@ -75,12 +88,20 @@ def apply_hold(
     state: SessionState,
     config: RouterConfig,
     mode: str = "active",
+    human_prompt_count: int | None = None,
 ) -> tuple[Decision, SessionState]:
     """The decision a live hold implies, and the state to store.
 
     Called only after the safety layer has run, so `decision` is safety's final
     answer: a SWITCH it approved, or a STAY it did not turn into a switch.
     A decision that is neither leaves the hold alone.
+
+    `human_prompt_count` is the request's own count of human prompts. A value
+    higher than the one the hold was recorded with means this is a NEW human
+    prompt, so the hold - which belongs to the previous prompt's tool loop - is
+    released here, before it could stand in for `decision`, and no
+    `HELD_MODEL` is served for this request. None on either side cannot say,
+    and then the hold behaves exactly as it did before this parameter existed.
     """
     if mode == MODE_OFF:
         # The router is off for this request. Whatever it was holding describes
@@ -94,11 +115,21 @@ def apply_hold(
             # router may make (Rule 7), so there is nothing to hold.
             return (decision, state.released_hold())
         # An approved switch is the truth about this session, so it becomes the
-        # hold and the previous one, if any, is gone.
-        return (decision, state.recorded_hold(target, requested_model))
+        # hold and the previous one, if any, is gone. The prompt count of THIS
+        # request is what the new hold protects.
+        return (
+            decision,
+            state.recorded_hold(target, requested_model, human_prompt_count),
+        )
 
     if not state.has_hold:
         return (decision, state)
+    if _is_new_human_prompt(state.held_prompt_count, human_prompt_count):
+        # A new human prompt. The hold was the memory of the previous prompt's
+        # tool loop, and this request is a different task: released here,
+        # before the hold could replace `decision`, so the policy's own answer
+        # for this request is what stands.
+        return (decision, state.released_hold())
     if requested_model != state.held_from_model:
         # The client moved on to another model. The hold was about this one.
         return (decision, state.released_hold())
@@ -130,6 +161,20 @@ def apply_hold(
 def _served(state: SessionState) -> SessionState:
     """The state after this request was served from the hold."""
     return replace(state, held_requests=state.held_requests + 1)
+
+
+def _is_new_human_prompt(held_count: int | None, request_count: int | None) -> bool:
+    """True only when this request is demonstrably a NEW human prompt.
+
+    True when both counts are known and the request's is the higher one. None
+    on either side cannot say, and then the answer is False: an undeterminable
+    value is never read as evidence that the prompt is new, and never as
+    evidence that it is not (Rule 2). A request whose count is known to be
+    higher is always caught here, so a hold can never be extended across one.
+    """
+    if held_count is None or request_count is None:
+        return False
+    return request_count > held_count
 
 
 def _cap_blocked(decision: Decision) -> bool:

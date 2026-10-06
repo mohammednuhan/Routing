@@ -24,6 +24,12 @@ Where the two formats differ:
 * there is no thinking switch either, so `has_thinking_enabled` is None rather
   than False. None means "this format cannot say", not "thinking was off".
 
+`human_prompt_count` is not one of the differences: it is read by the same
+`router/signals.count_human_prompts` helper, because a role `user` message
+carrying a string or a `text` part is a human prompt in this format exactly as
+it is in the other, and a role `tool` message carries no human text and is not
+counted. Both readers therefore answer the same question the same way.
+
 Everything else is the same heuristic as the Anthropic reader, so a request is
 scored the same way whichever format it arrived in.
 """
@@ -32,7 +38,7 @@ from __future__ import annotations
 from dataclasses import replace as dataclasses_replace
 from typing import Any
 
-from .signals import Signals
+from .signals import Signals, count_human_prompts
 
 
 def _bytes_len(obj: Any) -> int:
@@ -163,6 +169,7 @@ def compute_signals_openai(body_json: Any) -> Signals:
         return dataclasses_replace(
             signals,
             message_count=len(messages),
+            human_prompt_count=count_human_prompts(messages),
             turn_index=sum(
                 1 for m in messages if isinstance(m, dict) and _get(m, "role") == "assistant"
             ),
